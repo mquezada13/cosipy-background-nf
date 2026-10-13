@@ -1,2 +1,35 @@
+
+
+# Virtual environment
+.venv/
+
+# Data and generated outputs
 data/
 model/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# VS Code local settings
+.vscode/
+
+# Environment/secrets files
+.env
+.env.*
+
+# Build/package artifacts
+build/
+dist/
+*.egg-info/
+
+# Test/cache tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
