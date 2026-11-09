@@ -49,8 +49,8 @@ MODEL_PATH = PROJECT_ROOT / "model/nfbackground_v2-00.pt"
 ORIENTATION_PATH = PROJECT_ROOT / "data/DC4_orientation.ori"
 
 # Files created by this workflow; they are not contained in the checkpoint.
-TEST_OUTPUT_PATH = PROJECT_ROOT / "data/nf_background_test.hdf5"
-FULL_OUTPUT_PATH = PROJECT_ROOT / "data/nf_background_3months.hdf5"
+TEST_OUTPUT_PATH = PROJECT_ROOT / "data/NF_background/nf_background_test.hdf5"
+FULL_OUTPUT_PATH = PROJECT_ROOT / "data/NF_background/nf_background_3months.hdf5"
 # Use separate reproducible random streams for the total count and event times.
 EVENT_COUNT_SEED = 42
 EVENT_TIME_SEED = 43
