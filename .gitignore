@@ -6,6 +6,7 @@
 # Data and generated outputs
 data/
 model/
+notes/
 
 # Python cache
 __pycache__/
