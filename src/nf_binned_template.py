@@ -57,43 +57,38 @@ as a histpy Histogram with axes Em, Phi, PsiChi:
   coordinates with the attitude history, weighted by live time (same
   nearest-pixel method cosipy uses for its Galactic responses, see
   ``galactic_conversion_matrix``).
-The axes are those of cosipy's BinnedData after ``.project("Em", "Phi", "PsiChi")``.
+The binning is given as histpy Axes with labels "Em", "Phi" and "PsiChi",
+e.g. the axes of cosipy's BinnedData or of a response.
 
 Layout of this file
 -------------------
-- ``NFBinnedTemplate``: the integral (``compute`` -> ``_integrate_pixels``),
-  its quadrature nodes, the outputs (counts, histograms), and at the end the
-  input checks.
+- ``NFBinnedTemplate``: created from the model file only. The binning and the
+  quadrature settings are arguments of ``compute`` / ``get_binned_background``.
+  Order in the class: the integral (``compute`` -> ``_integrate_pixels``), its
+  quadrature nodes, the outputs, and at the end the input checks.
 - ``galactic_conversion_matrix``: spacecraft frame -> Galactic frame; a separate
   tool, also usable without a template (e.g. to rotate binned samples).
 
 Usage (DC4 511 keV imaging binning)
 -----------------------------------
-    import numpy as np
     from src.nf_binned_template import NFBinnedTemplate
 
-    template = NFBinnedTemplate(
-        "model/nfbackground_part-01_v3-00.fits",
-        em_edges_kev=[509.0, 513.0],
-        phi_edges_deg=np.arange(0, 181, 3),
-        nside=16, scheme="ring",
-        n_em_per_bin=4, n_phi_per_bin=4, subpixel_level=2,
-        em_breaks_kev=[511.0])
+    template = NFBinnedTemplate("model/nfbackground_part-01_v3-00.fits")
+    axes = binned_data.axes        # any histpy Axes with "Em", "Phi", "PsiChi" (other axes are ignored)
 
     background = template.get_binned_background(
-        "galactic", ori_file="data/DC4_orientation.ori",
-        tmin=1835487300.036206, tmax=1843467254.887687)
+        axes, "galactic", "data/DC4_orientation.ori",
+        tmin=1835487300.036206, tmax=1843467254.887687,
+        subpixel_level=2, n_em_per_bin=4, n_phi_per_bin=4, em_breaks_kev=[511.0])
 
     # Local frame on a few pixels only (the others are NaN):
-    local = template.get_binned_background("local", "data/DC4_orientation.ori",
+    local = template.get_binned_background(axes, "local", "data/DC4_orientation.ori",
                                            1835487300.036206, 1843467254.887687,
-                                           pixels=[255, 444])
+                                           pixels=[255, 444], em_breaks_kev=[511.0])
 
-    # Step by step instead (pixel indices in the scheme of the template):
-    print(template.n_evaluations([255, 444]))      # cost before running
-    rows = template.compute([255, 444])            # shape (1, 60, 2)
-    template.compute()                             # all pixels (hours)
-    hist = template.to_histogram()                 # probabilities P_i, axes Em, Phi, PsiChi
+    # Step by step (pixel indices in the scheme of the PsiChi axis):
+    print(template.n_evaluations(axes, [255, 444]))   # cost before running
+    rows = template.compute(axes, [255, 444])         # shape (1, 60, 2)
 """
 
 import time
@@ -112,33 +107,16 @@ from cosipy.background_estimation.ml.NFBackgroundModels import BackgroundDensity
 class NFBinnedTemplate:
     """Binned template P_i of an NF background model, by integration of its density.
 
-    The binning is Em x Phi x PsiChi (HEALPix, spacecraft frame). Results are
-    kept in ``probability`` (shape (n_em_bins, n_phi_bins, npix), NaN for pixels
-    not computed yet), so the sky can be computed in several ``compute`` calls,
-    for example with a different sub-pixel level in some regions.
+    Created from the model file only. The binning (histpy Axes with "Em",
+    "Phi", "PsiChi") and the quadrature settings are given to ``compute`` and
+    ``get_binned_background``. The last results are kept in ``probability``
+    (NaN for pixels not computed yet) and reused while the binning and the
+    quadrature settings stay the same; a call with different ones starts over.
 
     Parameters
     ----------
     model_path : str or Path
         NF background model file (.fits), major version 3.
-    em_edges_kev : array_like
-        Measured-energy bin edges [keV].
-    phi_edges_deg : array_like
-        Compton scattering angle bin edges [deg], within [0, 180].
-    nside : int
-        HEALPix NSIDE of the PsiChi axis (a power of 2).
-    scheme : str
-        Pixel ordering of the PsiChi axis, "nested" or "ring".
-    n_em_per_bin : int
-        GL nodes per energy bin (per piece if the bin is split at a break).
-    n_phi_per_bin : int
-        GL nodes per phi bin (per piece if the bin is split at a break).
-    subpixel_level : int
-        Default sub-pixel level k: 4**k sky nodes per pixel.
-    em_breaks_kev : array_like or None
-        Energies [keV] at which energy bins are split (e.g. [511.0]).
-    phi_breaks_deg : array_like or None
-        Angles [deg] at which phi bins are split.
     batch_size : int
         Number of points per forward pass of the flow (bounds the network's memory).
     device : str
@@ -146,54 +124,31 @@ class NFBinnedTemplate:
 
     Attributes
     ----------
+    model_version : str
+        Version of the model file.
     model_counts : float
         R * T, the number of events behind the model.
     model_livetime : float
         Livetime of the model [s].
-    probability : np.ndarray, shape (n_em_bins, n_phi_bins, npix)
-        P_i, float64; NaN where not computed.
-    subpixel_level_used : np.ndarray of int, shape (npix,)
+    probability : np.ndarray, shape (n_em_bins, n_phi_bins, npix), or None
+        P_i of the current binning, float64; NaN where not computed; None before
+        the first call.
+    subpixel_level_used : np.ndarray of int, shape (npix,), or None
         Sub-pixel level used for each pixel; -1 where not computed.
     """
 
-    def __init__(self, model_path, em_edges_kev, phi_edges_deg, nside, scheme,
-                 n_em_per_bin, n_phi_per_bin, subpixel_level,
-                 em_breaks_kev=None, phi_breaks_deg=None, batch_size=100_000, device="cpu"):
-
-        # --- Binning and quadrature settings (each one checked by a helper at the end) ---
+    def __init__(self, 
+                 model_path, 
+                 batch_size=100_000, 
+                 device="cpu"):
+        
         self.model_path = model_path
-        self.em_edges_kev = self._check_edges(em_edges_kev, "em_edges_kev")
-        self.phi_edges_deg = self._check_phi_edges(phi_edges_deg)
-        self.nside = self._check_nside(nside)
-        self.npix = hp.nside2npix(self.nside)
-        self.scheme = self._check_scheme(scheme)
-        self.nest = self.scheme == "nested"
-        self.n_em_per_bin = self._check_int(n_em_per_bin, "n_em_per_bin")
-        self.n_phi_per_bin = self._check_int(n_phi_per_bin, "n_phi_per_bin")
-        self.subpixel_level = self._check_int(subpixel_level, "subpixel_level", minimum=0)
-        self.em_breaks_kev = em_breaks_kev
-        self.phi_breaks_deg = phi_breaks_deg
         self.batch_size = self._check_int(batch_size, "batch_size")
         self.device = device
 
-        self.n_em_bins = len(self.em_edges_kev) - 1
-        self.n_phi_bins = len(self.phi_edges_deg) - 1
-
-        # --- Em and phi quadrature nodes: the same for every pixel, so built once ---
-        self.em_nodes_kev, self.em_weights_kev, self.em_bin_index = self._binned_gl_nodes(
-            self.em_edges_kev, self.n_em_per_bin, em_breaks_kev)
-
-        phi_breaks_rad = None if phi_breaks_deg is None else np.deg2rad(phi_breaks_deg)
-        self.phi_nodes_rad, self.phi_weights_rad, self.phi_bin_index = self._binned_gl_nodes(
-            np.deg2rad(self.phi_edges_deg), self.n_phi_per_bin, phi_breaks_rad)
-
-        # Matrices that sum weighted node values into bins: (n_em_bins, n_em_nodes), (n_phi_bins, n_phi_nodes)
-        self._em_matrix = self._node_to_bin_matrix(self.em_weights_kev, self.em_bin_index, self.n_em_bins)
-        self._phi_matrix = self._node_to_bin_matrix(self.phi_weights_rad, self.phi_bin_index, self.n_phi_bins)
-
         # --- Load the model once, in this process (no `devices` argument -> no worker pool) ---
-        nf_background = NFBackground(model_path, density_batch_size=self.batch_size,
-                                     density_compile_mode=None, show_progress=False)
+        nf_background = NFBackground(model_path, density_batch_size=self.batch_size,      # reads the .fits:
+                                     density_compile_mode=None, show_progress=False)      # weights, version, counts, livetime
         self._check_model_version(nf_background)
         self.model_version = nf_background._version
 
@@ -203,18 +158,28 @@ class NFBinnedTemplate:
         self.model_livetime = float(rate_input["livetime"])
 
         # The density network. Arguments: (density_input, device, batch_size, compile_mode).
-        self._density_model = BackgroundDensityECDFSplineDGaussianARQSFlow(
-            nf_background._density_input, device, self.batch_size, None)
+        self._density_model = BackgroundDensityECDFSplineDGaussianARQSFlow(       # the network that returns
+            nf_background._density_input, device, self.batch_size, None)          # p(Em, phi, psi, chi)
 
-        # --- Results: NaN / -1 until computed ---
-        self.probability = np.full((self.n_em_bins, self.n_phi_bins, self.npix), np.nan)
-        self.subpixel_level_used = np.full(self.npix, -1, dtype=np.int64)
+        # --- No binning yet: set by the first compute / get_binned_background call ---
+        self._settings = None
+        self.probability = None
+        self.subpixel_level_used = None
 
     # -----------------------------------------------------------------------
     # The integral
     # -----------------------------------------------------------------------
 
-    def compute(self, pixels=None, subpixel_level=None, points_per_chunk=2_000_000, verbose=True):
+    def compute(self, 
+                axes, 
+                pixels=None, 
+                subpixel_level=2, 
+                n_em_per_bin=4, 
+                n_phi_per_bin=4,
+                em_breaks_kev=None, 
+                phi_breaks_deg=None, 
+                points_per_chunk=2_000_000, 
+                verbose=True):
         """Integrate the NF density over every (Em, phi) bin of the given pixels.
 
         Pixels are processed in chunks of about ``points_per_chunk`` density
@@ -224,10 +189,17 @@ class NFBinnedTemplate:
 
         Parameters
         ----------
+        axes : histpy.Axes
+            Binning, with axes "Em" [energy], "Phi" [angle] and "PsiChi" (HealpixAxis).
+            Other axes (e.g. "Time") are ignored.
         pixels : array_like of int or None
-            Pixel indices (in ``scheme``); None means all pixels.
-        subpixel_level : int or None
-            Sub-pixel level k for this call; None uses the default of the instance.
+            Pixel indices (in the scheme of PsiChi); None means all pixels.
+        subpixel_level : int
+            Sub-pixel level k: 4**k sky nodes per pixel.
+        n_em_per_bin, n_phi_per_bin : int
+            GL nodes per Em / phi bin (per piece if the bin is split at a break).
+        em_breaks_kev, phi_breaks_deg : array_like or None
+            Points at which Em [keV] / phi [deg] bins are split (e.g. em_breaks_kev=[511.0]).
         points_per_chunk : int
             Target number of density evaluations per chunk (at least one pixel).
         verbose : bool
@@ -238,12 +210,24 @@ class NFBinnedTemplate:
         np.ndarray, shape (n_em_bins, n_phi_bins, n_pixels)
             P_i for the given pixels, in the order given.
         """
+
+        self._set_binning(                  # Em and phi points for this binning (reused if unchanged)
+            axes,
+            n_em_per_bin, 
+            n_phi_per_bin, 
+            em_breaks_kev, 
+            phi_breaks_deg
+            )
         pixels = self._check_pixels(pixels)
-        k = self._subpixel_level_or_default(subpixel_level)
+
+        k = self._check_int(
+            subpixel_level, 
+            "subpixel_level", 
+            minimum=0)
 
         # Group pixels into chunks of about points_per_chunk density evaluations
-        points_per_pixel = self._evaluations_per_pixel(k)
-        pixels_per_chunk = max(1, points_per_chunk // points_per_pixel)
+        points_per_pixel = self._evaluations_per_pixel(k)                 # n_Em points x n_phi points x 4**k
+        pixels_per_chunk = max(1, points_per_chunk // points_per_pixel)   # how many pixels fit in one chunk
         n_chunks = -(-len(pixels) // pixels_per_chunk)    # ceiling division
 
         if verbose:
@@ -251,11 +235,12 @@ class NFBinnedTemplate:
                   f"in {n_chunks} chunks of up to {pixels_per_chunk} pixels")
 
         start_time = time.perf_counter()
+
         for i, start in enumerate(range(0, len(pixels), pixels_per_chunk)):
             # Integrate one chunk and store it, so finished chunks survive an interruption
             chunk = pixels[start:start + pixels_per_chunk]
-            self.probability[:, :, chunk] = self._integrate_pixels(chunk, k)
-            self.subpixel_level_used[chunk] = k
+            self.probability[:, :, chunk] = self._integrate_pixels(chunk, k)   # THE INTEGRAL of this chunk, stored
+            self.subpixel_level_used[chunk] = k                                # remember the k of each pixel
 
             if verbose:
                 elapsed = time.perf_counter() - start_time
@@ -264,6 +249,7 @@ class NFBinnedTemplate:
                       f"{done * points_per_pixel / elapsed:,.0f} evaluations/s")
 
         return self.probability[:, :, pixels].copy()
+
 
     def _integrate_pixels(self, pixels, k):
         """P_i for a group of pixels: the weighted sum over all quadrature nodes.
@@ -284,14 +270,14 @@ class NFBinnedTemplate:
             self.nside, k, pixels, nest=self.nest)                       # each (n_pixels, 4**k)
 
         # 2. NF density at every (Em node, phi node, sky node)
-        density = self._density_on_grid(colatitude.ravel(), longitude.ravel())
-        density = density.reshape(len(self.em_nodes_kev), len(self.phi_nodes_rad), len(pixels), 4**k)
+        density = self._density_on_grid(colatitude.ravel(), longitude.ravel())   # all sky points as one list
+        density = density.reshape(len(self.em_nodes_kev), len(self.phi_nodes_rad), len(pixels), 4**k)  # split sky axis into (pixel, sub-pixel)
 
         # 3. Weighted sum over the nodes of each bin:
         # P[a, b, c] = sum_e sum_p sum_s  M_E[a, e] * M_phi[b, p] * density[e, p, c, s] * w_sky[c, s]
         # a: energy bin, b: phi bin, c: pixel; e, p, s: Em, phi and sky nodes.
-        return np.einsum("ae,bp,epcs,cs->abc", self._em_matrix, self._phi_matrix,
-                         density, sky_weights, optimize=True)
+        return np.einsum("ae,bp,epcs,cs->abc", self._em_matrix, self._phi_matrix,   # weights x density, added
+                         density, sky_weights, optimize=True)                         # up per bin -> P_i
 
     def _density_on_grid(self, colatitude, longitude):
         """NF density on (Em nodes) x (phi nodes) x (list of sky points).
@@ -308,18 +294,53 @@ class NFBinnedTemplate:
         """
         shape = (len(self.em_nodes_kev), len(self.phi_nodes_rad), len(colatitude))
 
-        # The four coordinates of every grid point, filled by broadcasting
-        grid = np.empty((4,) + shape)
-        grid[0] = self.em_nodes_kev[:, None, None]
-        grid[1] = self.phi_nodes_rad[None, :, None]
-        grid[2] = longitude[None, None, :]        # chi
-        grid[3] = colatitude[None, None, :]       # psi
-        em, phi, chi, psi = torch.from_numpy(grid.reshape(4, -1))
+        # List of points to evaluate: every Em point x every phi point x every sky point
+        grid = np.empty((4,) + shape)                 # 4 layers (Em, phi, chi, psi), one cell per combination
+        grid[0] = self.em_nodes_kev[:, None, None]    # Em varies along axis 0, repeated along the others
+        grid[1] = self.phi_nodes_rad[None, :, None]   # phi varies along axis 1
+        grid[2] = longitude[None, None, :]            # chi varies along axis 2 (sky point) ...
+        grid[3] = colatitude[None, None, :]           # ... together with psi: each sky point is one (psi, chi) pair
+        em, phi, chi, psi = torch.from_numpy(grid.reshape(4, -1))   # flatten: 4 lists of n_Em*n_phi*n_sky values
 
         # Evaluate the flow. The context (time) is ignored by version 3 models; it only sets the number of points.
         context = torch.zeros(em.shape[0], dtype=torch.float32)
-        density = self._density_model.evaluate_density(context, em, phi, chi, psi)
-        return density.numpy().astype(np.float64).reshape(shape)
+        density = self._density_model.evaluate_density(context, em, phi, chi, psi)   # p at every point
+        return density.numpy().astype(np.float64).reshape(shape)                     # back to (n_Em, n_phi, n_sky)
+
+    def _set_binning(self, axes, n_em_per_bin, n_phi_per_bin, em_breaks_kev, phi_breaks_deg):
+        """Prepare the quadrature nodes for this binning; keep the results if nothing changed."""
+        em_edges_kev, phi_edges_deg, nside, scheme = self._check_axes(axes)
+        n_em_per_bin = self._check_int(n_em_per_bin, "n_em_per_bin")
+        n_phi_per_bin = self._check_int(n_phi_per_bin, "n_phi_per_bin")
+        em_breaks_kev = self._as_breaks(em_breaks_kev)
+        phi_breaks_deg = self._as_breaks(phi_breaks_deg)
+
+        # Same binning and settings as the last call: reuse the stored nodes and results
+        settings = (tuple(em_edges_kev), tuple(phi_edges_deg), nside, scheme,
+                    n_em_per_bin, n_phi_per_bin, tuple(em_breaks_kev), tuple(phi_breaks_deg))
+        if settings == self._settings:
+            return
+
+        # New binning: store it ...
+        self.em_edges_kev, self.phi_edges_deg = em_edges_kev, phi_edges_deg
+        self.nside, self.scheme, self.nest = nside, scheme, scheme == "nested"
+        self.npix = hp.nside2npix(nside)
+        self.n_em_bins, self.n_phi_bins = len(em_edges_kev) - 1, len(phi_edges_deg) - 1
+
+        # ... build the Em and phi nodes (the same for every pixel) ...
+        self.em_nodes_kev, em_weights, em_bin_index = self._binned_gl_nodes(         # Em points, weights [keV],
+            em_edges_kev, n_em_per_bin, em_breaks_kev)                               # and the bin of each point
+        self.phi_nodes_rad, phi_weights, phi_bin_index = self._binned_gl_nodes(      # same for phi, in rad
+            np.deg2rad(phi_edges_deg), n_phi_per_bin, np.deg2rad(phi_breaks_deg))
+
+        # ... and the matrices that sum weighted node values into bins
+        self._em_matrix = self._node_to_bin_matrix(em_weights, em_bin_index, self.n_em_bins)       # (Em bins, Em points)
+        self._phi_matrix = self._node_to_bin_matrix(phi_weights, phi_bin_index, self.n_phi_bins)   # (phi bins, phi points)
+
+        # Start over: nothing computed for this binning yet
+        self.probability = np.full((self.n_em_bins, self.n_phi_bins, self.npix), np.nan)
+        self.subpixel_level_used = np.full(self.npix, -1, dtype=np.int64)
+        self._settings = settings
 
     # -----------------------------------------------------------------------
     # Quadrature nodes
@@ -328,12 +349,12 @@ class NFBinnedTemplate:
     @staticmethod
     def _gl_nodes(a, b, n):
         """Gauss-Legendre nodes and weights on [a, b]; the weights sum to b - a."""
-        x, w = np.polynomial.legendre.leggauss(n)
+        x, w = np.polynomial.legendre.leggauss(n)     # standard GL points and weights on [-1, 1]
         # Map the standard nodes on [-1, 1] linearly onto [a, b]
         return 0.5 * (b - a) * x + 0.5 * (b + a), 0.5 * (b - a) * w
 
     @staticmethod
-    def _binned_gl_nodes(edges, n_per_bin, breaks=None):
+    def _binned_gl_nodes(edges, n_per_bin, breaks=()):
         """Gauss-Legendre nodes for every bin of a 1D binning.
 
         A bin that contains break points strictly inside it is split at those
@@ -347,7 +368,7 @@ class NFBinnedTemplate:
             Index of the bin that contains each node.
         """
         edges = np.asarray(edges, dtype=np.float64)
-        breaks = np.unique(np.asarray([] if breaks is None else breaks, dtype=np.float64))
+        breaks = np.unique(np.asarray(breaks, dtype=np.float64))
 
         nodes, weights, bin_index = [], [], []
         for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
@@ -378,37 +399,54 @@ class NFBinnedTemplate:
             Sub-pixel areas [sr].
         """
         pixels = np.atleast_1d(np.asarray(pixels, dtype=np.int64))
-        parents_nest = pixels if nest else hp.ring2nest(nside, pixels)
+        parents_nest = pixels if nest else hp.ring2nest(nside, pixels)         # sub-pixels are defined in NESTED numbering
 
-        n_sub = 4**k
-        nside_sub = nside * 2**k
-        children = parents_nest[:, None] * n_sub + np.arange(n_sub)[None, :]   # (n_pixels, n_sub)
+        n_sub = 4**k                                                           # sub-pixels per pixel
+        nside_sub = nside * 2**k                                               # finer HEALPix grid of the sub-pixels
+        children = parents_nest[:, None] * n_sub + np.arange(n_sub)[None, :]   # indices of the sub-pixels, (n_pixels, n_sub)
 
-        colatitude, longitude = hp.pix2ang(nside_sub, children.ravel(), nest=True)
-        weights = np.full(children.shape, hp.nside2pixarea(nside_sub))         # all HEALPix pixels have equal area
+        colatitude, longitude = hp.pix2ang(nside_sub, children.ravel(), nest=True)   # centre of each sub-pixel
+        weights = np.full(children.shape, hp.nside2pixarea(nside_sub))         # weight = sub-pixel area (all equal in HEALPix)
         return colatitude.reshape(children.shape), longitude.reshape(children.shape), weights
 
     @staticmethod
     def _node_to_bin_matrix(weights, bin_index, n_bins):
         """M[b, n] = weights[n] if node n lies in bin b, else 0; M @ f sums f over each bin."""
         matrix = np.zeros((n_bins, len(weights)))
-        matrix[bin_index, np.arange(len(weights))] = weights
+        matrix[bin_index, np.arange(len(weights))] = weights    # row = bin, column = point, value = its weight
         return matrix
 
     # -----------------------------------------------------------------------
     # Outputs
     # -----------------------------------------------------------------------
 
-    def get_binned_background(self, frame, ori_file, tmin, tmax, pixels=None, scatt_nside=32):
+    def get_binned_background(
+            self, 
+            axes, 
+            frame, 
+            ori_file, 
+            tmin, 
+            tmax, 
+            pixels=None,
+            subpixel_level=2, 
+            n_em_per_bin=4, 
+            n_phi_per_bin=4,
+            em_breaks_kev=None, 
+            phi_breaks_deg=None, 
+            scatt_nside=32
+            ):
         """Expected background counts in [tmin, tmax], binned in Em x Phi x PsiChi.
 
         N_i = R * P_i * (live time), with R = model_counts / model_livetime and
-        the live time taken from the orientation file. Requested pixels not
-        computed yet are computed first with the default sub-pixel level (all
-        pixels take hours).
+        the live time taken from the orientation file. Requested pixels not yet
+        computed at ``subpixel_level`` (with this binning and these settings) are
+        computed first; all pixels take hours.
 
         Parameters
         ----------
+        axes : histpy.Axes
+            Binning, with axes "Em", "Phi" and "PsiChi" (others are ignored).
+            Only the NSIDE and scheme of PsiChi are used, not its frame.
         frame : str
             "local" (spacecraft frame) or "galactic".
         ori_file : str or Path
@@ -416,25 +454,28 @@ class NFBinnedTemplate:
         tmin, tmax : float
             Time window [s] (unix seconds, as the event TimeTags).
         pixels : array_like of int or None
-            Local frame only: pixels to compute (in ``scheme``) if not computed
-            yet; pixels never computed are NaN in the result. None means all
-            pixels. The Galactic frame needs every pixel, so pixels must be None.
+            Local frame only: pixels to compute (in the scheme of PsiChi); pixels
+            never computed are NaN in the result. None means all pixels. The
+            Galactic frame needs every pixel, so pixels must be None.
+        subpixel_level, n_em_per_bin, n_phi_per_bin, em_breaks_kev, phi_breaks_deg
+            Quadrature settings, as in ``compute``.
         scatt_nside : int
             Attitude grouping for the Galactic rotation (see ``galactic_conversion_matrix``).
 
         Returns
         -------
         histpy.Histogram, shape (n_em_bins, n_phi_bins, npix)
-            Axes "Em" [keV], "Phi" [deg], "PsiChi" (NSIDE and scheme of the template,
-            spacecraft or Galactic frame): the axes of cosipy's BinnedData after
-            ``.project("Em", "Phi", "PsiChi")``.
+            Axes "Em" [keV], "Phi" [deg], "PsiChi" (NSIDE and scheme of ``axes``,
+            spacecraft or Galactic frame).
         """
         self._check_frame(frame, pixels)
+        self._set_binning(axes, n_em_per_bin, n_phi_per_bin, em_breaks_kev, phi_breaks_deg)
+        k = self._check_int(subpixel_level, "subpixel_level", minimum=0)
 
-        # 1. Integrate the requested pixels that are not computed yet
-        missing = self._missing_pixels(pixels)
+        # 1. Integrate the requested pixels not yet computed at level k
+        missing = self._missing_pixels(pixels, k)
         if missing.size:
-            self.compute(missing)
+            self.compute(axes, missing, k, n_em_per_bin, n_phi_per_bin, em_breaks_kev, phi_breaks_deg)
 
         # 2. Rate of the model and attitude / live time in the window
         history = SpacecraftHistory.open(ori_file).select_interval(
@@ -443,16 +484,17 @@ class NFBinnedTemplate:
 
         # 3a. Local frame: counts = rate * live time * P
         if frame == "local":
-            livetime = float(history.livetime.to_value(u.s).sum())
+            livetime = float(history.livetime.to_value(u.s).sum())          # total live time in [tmin, tmax] [s]
             return Histogram(self._axes(SpacecraftFrame()), contents=rate * livetime * self.probability)
 
         # 3b. Galactic frame: rotate with W (live time each Galactic pixel spends in each local pixel)
-        W = galactic_conversion_matrix(history, self.nside, self.nest, scatt_nside)
-        counts = rate * (self.probability @ W.T)                # (Em, Phi, local) -> (Em, Phi, Galactic)
+        W = galactic_conversion_matrix(history, self.nside, self.nest, scatt_nside)   # (Galactic pix, local pix) [s]
+        counts = rate * (self.probability @ W.T)                # each Galactic pixel collects local P weighted by live time
         return Histogram(self._axes("galactic"), contents=counts)
 
     def expected_counts(self):
-        """Expected counts N_i = R * T * P_i for all pixels, shape (n_em_bins, n_phi_bins, npix); NaN if not computed."""
+        """Expected counts N_i = R * T * P_i of the current binning, shape (n_em_bins, n_phi_bins, npix); NaN if not computed."""
+        self._check_binning_set()
         return self.model_counts * self.probability
 
     def to_histogram(self):
@@ -460,18 +502,24 @@ class NFBinnedTemplate:
 
         Only allowed once every pixel has been computed.
         """
+        self._check_binning_set()
         self._check_all_computed()
         return Histogram(self._axes(SpacecraftFrame()), contents=self.probability)
 
-    def n_evaluations(self, pixels=None, subpixel_level=None):
-        """Number of density evaluations a ``compute`` call would need.
+    def n_evaluations(self, axes, pixels=None, subpixel_level=2, n_em_per_bin=4, n_phi_per_bin=4,
+                      em_breaks_kev=None, phi_breaks_deg=None):
+        """Number of density evaluations a ``compute`` call with these arguments would need.
 
-        Divide by the measured throughput (about 7,000 evaluations/s on CPU) to
-        estimate the run time. ``pixels`` None means all pixels; ``subpixel_level``
-        None uses the default of the instance.
+        Does not change the stored results. Divide by the measured throughput
+        (about 7,000 evaluations/s on CPU) to estimate the run time.
         """
-        k = self._subpixel_level_or_default(subpixel_level)
-        return self._evaluations_per_pixel(k) * len(self._check_pixels(pixels))
+        em_edges_kev, phi_edges_deg, nside, _ = self._check_axes(axes)
+        n_em_nodes = len(self._binned_gl_nodes(em_edges_kev, self._check_int(n_em_per_bin, "n_em_per_bin"),
+                                               self._as_breaks(em_breaks_kev))[0])
+        n_phi_nodes = len(self._binned_gl_nodes(phi_edges_deg, self._check_int(n_phi_per_bin, "n_phi_per_bin"),
+                                                self._as_breaks(phi_breaks_deg))[0])
+        n_pixels = hp.nside2npix(nside) if pixels is None else len(np.atleast_1d(pixels))
+        return n_em_nodes * n_phi_nodes * 4**self._check_int(subpixel_level, "subpixel_level", minimum=0) * n_pixels
 
     def _evaluations_per_pixel(self, k):
         # Grid points per pixel: Em nodes x phi nodes x sky nodes
@@ -484,20 +532,36 @@ class NFBinnedTemplate:
                      HealpixAxis(nside=self.nside, scheme=self.scheme,
                                  coordsys=coordsys, label="PsiChi")])
 
-    def _missing_pixels(self, pixels):
-        # Requested pixels (None -> all) that are not computed yet
+    def _missing_pixels(self, pixels, k):
+        # Requested pixels (None -> all) not computed yet at sub-pixel level k
         pixels = self._check_pixels(pixels)
-        return pixels[np.isnan(self.probability[:, :, pixels]).any(axis=(0, 1))]
+        return pixels[self.subpixel_level_used[pixels] != k]
 
-    def _subpixel_level_or_default(self, subpixel_level):
-        # Sub-pixel level of a call: the given one (checked) or the default of the instance
-        if subpixel_level is None:
-            return self.subpixel_level
-        return self._check_int(subpixel_level, "subpixel_level", minimum=0)
+    @staticmethod
+    def _as_breaks(breaks):
+        # Break points as a 1D float array (None -> empty)
+        return np.atleast_1d(np.asarray([] if breaks is None else breaks, dtype=np.float64))
 
     # -----------------------------------------------------------------------
     # Checks
     # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _check_axes(axes):
+        # Binning from histpy Axes: Em edges [keV], Phi edges [deg] within [0, 180], PsiChi NSIDE and scheme
+        labels = list(axes.labels)
+        for label in ("Em", "Phi", "PsiChi"):
+            if label not in labels:
+                raise ValueError(f"axes must contain 'Em', 'Phi' and 'PsiChi', got {labels}.")
+
+        em_edges = NFBinnedTemplate._check_edges(axes["Em"].edges.to_value(u.keV), "Em edges")
+        phi_edges = NFBinnedTemplate._check_edges(axes["Phi"].edges.to_value(u.deg), "Phi edges")
+        if phi_edges[0] < 0 or phi_edges[-1] > 180:
+            raise ValueError("Phi edges must lie within [0, 180] deg.")
+
+        psichi = axes["PsiChi"]
+        return em_edges, phi_edges, NFBinnedTemplate._check_nside(psichi.nside), \
+            NFBinnedTemplate._check_scheme(psichi.scheme)
 
     @staticmethod
     def _check_edges(edges, name):
@@ -508,26 +572,18 @@ class NFBinnedTemplate:
         return edges
 
     @staticmethod
-    def _check_phi_edges(phi_edges_deg):
-        # Phi edges: valid edges within [0, 180] deg
-        edges = NFBinnedTemplate._check_edges(phi_edges_deg, "phi_edges_deg")
-        if edges[0] < 0 or edges[-1] > 180:
-            raise ValueError("phi_edges_deg must lie within [0, 180].")
-        return edges
-
-    @staticmethod
     def _check_nside(nside):
         # Sub-pixels are NESTED children, so NSIDE must be a power of 2 for both schemes
         if not hp.isnsideok(nside, nest=True):
-            raise ValueError(f"nside must be a power of 2, got {nside}.")
+            raise ValueError(f"PsiChi nside must be a power of 2, got {nside}.")
         return int(nside)
 
     @staticmethod
     def _check_scheme(scheme):
         # Pixel ordering: "nested" or "ring" (case-insensitive)
-        scheme = scheme.lower()
+        scheme = str(scheme).lower()
         if scheme not in ("nested", "ring"):
-            raise ValueError(f"scheme must be 'nested' or 'ring', got {scheme!r}.")
+            raise ValueError(f"PsiChi scheme must be 'nested' or 'ring', got {scheme!r}.")
         return scheme
 
     @staticmethod
@@ -546,7 +602,7 @@ class NFBinnedTemplate:
                 f"got version {nf_background._version}.")
 
     def _check_pixels(self, pixels):
-        # Pixel indices (in self.scheme) as a 1D array of unique, valid ints; None means all pixels
+        # Pixel indices as a 1D array of unique, valid ints; None means all pixels
         if pixels is None:
             return np.arange(self.npix)
         pixels = np.atleast_1d(np.asarray(pixels, dtype=np.int64))
@@ -557,6 +613,11 @@ class NFBinnedTemplate:
         if len(np.unique(pixels)) != len(pixels):
             raise ValueError("pixel indices must be unique.")
         return pixels
+
+    def _check_binning_set(self):
+        # A binning must have been given by a compute / get_binned_background call
+        if self._settings is None:
+            raise RuntimeError("No binning yet: call compute or get_binned_background first.")
 
     def _check_all_computed(self):
         # Every pixel must be computed (no NaN left in probability)
@@ -577,7 +638,13 @@ class NFBinnedTemplate:
 # Spacecraft frame -> Galactic frame (separate tool, also used without a template)
 # ---------------------------------------------------------------------------
 
-def galactic_conversion_matrix(history, nside, nest, scatt_nside=32, attitudes_per_chunk=512):
+def galactic_conversion_matrix(
+        history, 
+        nside, 
+        nest, 
+        scatt_nside=32, 
+        attitudes_per_chunk=512
+        ):
     """Live time that each Galactic pixel spends in each spacecraft-frame pixel.
 
     W[g, l] is the live time [s] during which the center of Galactic pixel g
