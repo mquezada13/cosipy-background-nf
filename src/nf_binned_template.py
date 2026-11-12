@@ -587,12 +587,13 @@ class NFBinnedTemplate:
                      HealpixAxis(nside=self.nside, scheme=self.scheme,
                                  coordsys=coordsys, label="PsiChi")])
 
-    def get_binned_background(self, frame, ori_file, tmin, tmax, scatt_nside=32):
+    def get_binned_background(self, frame, ori_file, tmin, tmax, pixels=None, scatt_nside=32):
         """Expected background counts in [tmin, tmax], binned in Em x Phi x PsiChi.
 
         N_i = R * P_i * (live time), with R = model_counts / model_livetime and
-        the live time taken from the orientation file. Pixels not computed yet
-        are computed first with the default sub-pixel level (all pixels take hours).
+        the live time taken from the orientation file. Requested pixels not
+        computed yet are computed first with the default sub-pixel level (all
+        pixels take hours).
 
         Parameters
         ----------
@@ -602,6 +603,10 @@ class NFBinnedTemplate:
             Orientation file (.ori or .fits) with attitude and live time.
         tmin, tmax : float
             Time window [s] (unix seconds, as the event TimeTags).
+        pixels : array_like of int or None
+            Local frame only: pixels to compute (in ``scheme``) if not computed
+            yet; pixels never computed are NaN in the result. None means all
+            pixels. The Galactic frame needs every pixel, so pixels must be None.
         scatt_nside : int
             Attitude grouping for the Galactic rotation (see ``galactic_conversion_matrix``).
 
@@ -614,8 +619,11 @@ class NFBinnedTemplate:
         """
         if frame not in ("local", "galactic"):
             raise ValueError(f"frame must be 'local' or 'galactic', got {frame!r}.")
+        if frame == "galactic" and pixels is not None:
+            raise ValueError("The Galactic frame mixes all spacecraft-frame pixels; use pixels=None.")
 
-        missing = np.flatnonzero(np.isnan(self.probability).any(axis=(0, 1)))
+        needed = self._check_pixels(pixels)                     # None -> all pixels
+        missing = needed[np.isnan(self.probability[:, :, needed]).any(axis=(0, 1))]
         if missing.size:
             self.compute(missing)
 
