@@ -41,6 +41,13 @@ Units and conventions
   psi = colatitude ("Psi local"), chi = longitude ("Chi local"), both in rad.
   The NF source code uses swapped names; this module always uses COSIpy names.
 - Solid angle: dOmega = dcos(psi) dchi.
+- chi = 0 seam: the flow works in u = chi / 2pi in [0, 1], so chi = 0 is the
+  edge of its domain, and its density is wrong in a thin strip there
+  (~0.05 deg on the chi < 0 side, ~0.1-0.15 deg on the chi > 0 side).
+  HEALPix sub-pixel centres lie exactly on chi = 0, so sky nodes with
+  chi < delta are evaluated at chi = delta, and those with chi > 2pi - delta
+  at 2pi - delta (``seam_delta_deg``, default 0.2 deg; 0 turns it off).
+  Results do not depend on delta for 0.1-0.3 deg (notebook 09, Section 9).
 - The density is evaluated without truncation to the flow's sampling domain,
   so the P_i are not renormalized by the domain mass Z <= 1. The density is
   returned by cosipy as float32; all sums here are accumulated in float64.
@@ -121,6 +128,10 @@ class NFBinnedTemplate:
         Number of points per forward pass of the flow (bounds the network's memory).
     device : str
         Torch device for the flow, e.g. "cpu" or "cuda".
+    seam_delta_deg : float
+        Half-width [deg] of the strip at chi = 0 where the flow's density is
+        wrong: sky nodes with chi < delta (or > 360 deg - delta) are evaluated
+        at chi = delta (or 360 deg - delta). 0 turns the correction off.
 
     Attributes
     ----------
@@ -130,6 +141,8 @@ class NFBinnedTemplate:
         R * T, the number of events behind the model.
     model_livetime : float
         Livetime of the model [s].
+    seam_delta_rad : float
+        Half-width of the chi = 0 strip [rad] (from ``seam_delta_deg``).
     probability : np.ndarray, shape (n_em_bins, n_phi_bins, npix), or None
         P_i of the current binning, float64; NaN where not computed; None before
         the first call.
@@ -139,12 +152,14 @@ class NFBinnedTemplate:
 
     def __init__(self, 
                  model_path, 
-                 batch_size=100_000, 
-                 device="cpu"):
-        
+                 batch_size=100_000,
+                 device="cpu",
+                 seam_delta_deg=0.2):
+
         self.model_path = model_path
         self.batch_size = self._check_int(batch_size, "batch_size")
         self.device = device
+        self.seam_delta_rad = np.deg2rad(self._check_seam_delta(seam_delta_deg))   # chi = 0 strip half-width [rad]
 
         # --- Load the model once, in this process (no `devices` argument -> no worker pool) ---
         nf_background = NFBackground(model_path, density_batch_size=self.batch_size,      # reads the .fits:
@@ -293,6 +308,9 @@ class NFBinnedTemplate:
             Density [keV^-1 rad^-1 sr^-1].
         """
         shape = (len(self.em_nodes_kev), len(self.phi_nodes_rad), len(colatitude))
+
+        # chi = 0 seam: nodes inside the strip where the flow's density is wrong are moved just outside it
+        longitude = np.clip(longitude, self.seam_delta_rad, 2 * np.pi - self.seam_delta_rad)
 
         # List of points to evaluate: every Em point x every phi point x every sky point
         grid = np.empty((4,) + shape)                 # 4 layers (Em, phi, chi, psi), one cell per combination
@@ -592,6 +610,14 @@ class NFBinnedTemplate:
         if int(value) != value or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}, got {value}.")
         return int(value)
+
+    @staticmethod
+    def _check_seam_delta(value):
+        # Half-width of the chi = 0 strip [deg]: a number in [0, 1); 0 turns the correction off
+        value = float(value)
+        if not 0 <= value < 1:
+            raise ValueError(f"seam_delta_deg must be in [0, 1) deg, got {value}.")
+        return value
 
     @staticmethod
     def _check_model_version(nf_background):
