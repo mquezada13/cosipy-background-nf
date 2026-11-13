@@ -31,6 +31,13 @@ Quadrature rules
   area (a midpoint rule on the sphere). All sky nodes come from
   ``NFBinnedTemplate._healpix_subpixel_nodes``; a different sky rule can replace
   it as long as it returns the same (colatitude, longitude, weight) arrays.
+- Sky, polar pixels: the flow's density has a tall, narrow peak at the poles
+  (psi = 0 and 180 deg), so pixels whose centre is within ``polar_cap_deg`` of a
+  pole use level ``polar_subpixel_level`` (at least k), and their sub-pixels with
+  centre within ``pole_colat_deg`` of the pole are split further to
+  ``pole_subpixel_level`` (``_polar_refined_nodes``). Defaults (4 deg, 5, 1 deg,
+  7) select the 8 pixels touching the poles at NSIDE 16 and agree with uniform
+  level 7 within 0.3% (notebook 09, Section 10).
 
 Units and conventions
 ---------------------
@@ -132,6 +139,16 @@ class NFBinnedTemplate:
         Half-width [deg] of the strip at chi = 0 where the flow's density is
         wrong: sky nodes with chi < delta (or > 360 deg - delta) are evaluated
         at chi = delta (or 360 deg - delta). 0 turns the correction off.
+    polar_cap_deg : float
+        Pixels whose centre is within this angle [deg] of a pole are polar
+        pixels and get the refined sky rule below. 0 turns the refinement off.
+    polar_subpixel_level : int
+        Sub-pixel level of polar pixels (the larger of this and ``subpixel_level``).
+    pole_colat_deg : float
+        Sub-pixels of a polar pixel with centre within this angle [deg] of the
+        pole are split further.
+    pole_subpixel_level : int
+        Level of those sub-pixels (at least the level of the polar pixel).
 
     Attributes
     ----------
@@ -143,6 +160,10 @@ class NFBinnedTemplate:
         Livetime of the model [s].
     seam_delta_rad : float
         Half-width of the chi = 0 strip [rad] (from ``seam_delta_deg``).
+    polar_cap_rad, pole_colat_rad : float
+        ``polar_cap_deg`` and ``pole_colat_deg`` in rad.
+    polar_subpixel_level, pole_subpixel_level : int
+        As the parameters.
     probability : np.ndarray, shape (n_em_bins, n_phi_bins, npix), or None
         P_i of the current binning, float64; NaN where not computed; None before
         the first call.
@@ -154,12 +175,22 @@ class NFBinnedTemplate:
                  model_path, 
                  batch_size=100_000,
                  device="cpu",
-                 seam_delta_deg=0.2):
+                 seam_delta_deg=0.2,
+                 polar_cap_deg=4.0,
+                 polar_subpixel_level=5,
+                 pole_colat_deg=1.0,
+                 pole_subpixel_level=7):
 
         self.model_path = model_path
         self.batch_size = self._check_int(batch_size, "batch_size")
         self.device = device
         self.seam_delta_rad = np.deg2rad(self._check_seam_delta(seam_delta_deg))   # chi = 0 strip half-width [rad]
+
+        # Polar pixels: finer sky nodes, and finer still close to the pole
+        self.polar_cap_rad = np.deg2rad(self._check_angle(polar_cap_deg, "polar_cap_deg"))
+        self.pole_colat_rad = np.deg2rad(self._check_angle(pole_colat_deg, "pole_colat_deg"))
+        self.polar_subpixel_level = self._check_int(polar_subpixel_level, "polar_subpixel_level", minimum=0)
+        self.pole_subpixel_level = self._check_int(pole_subpixel_level, "pole_subpixel_level", minimum=0)
 
         # --- Load the model once, in this process (no `devices` argument -> no worker pool) ---
         nf_background = NFBackground(model_path, density_batch_size=self.batch_size,      # reads the .fits:
@@ -210,7 +241,8 @@ class NFBinnedTemplate:
         pixels : array_like of int or None
             Pixel indices (in the scheme of PsiChi); None means all pixels.
         subpixel_level : int
-            Sub-pixel level k: 4**k sky nodes per pixel.
+            Sub-pixel level k: 4**k sky nodes per pixel. Polar pixels use the
+            polar rule instead (see ``polar_cap_deg``).
         n_em_per_bin, n_phi_per_bin : int
             GL nodes per Em / phi bin (per piece if the bin is split at a break).
         em_breaks_kev, phi_breaks_deg : array_like or None
@@ -240,28 +272,44 @@ class NFBinnedTemplate:
             "subpixel_level", 
             minimum=0)
 
-        # Group pixels into chunks of about points_per_chunk density evaluations
+        # Polar pixels get their own sky rule (see the module notes); the others use level k
+        is_polar = self._is_polar(self.nside, pixels, self.nest, self.polar_cap_rad)
+        normal, polar = pixels[~is_polar], pixels[is_polar]
+
+        # Group the normal pixels into chunks of about points_per_chunk density evaluations
         points_per_pixel = self._evaluations_per_pixel(k)                 # n_Em points x n_phi points x 4**k
         pixels_per_chunk = max(1, points_per_chunk // points_per_pixel)   # how many pixels fit in one chunk
-        n_chunks = -(-len(pixels) // pixels_per_chunk)    # ceiling division
+        n_chunks = -(-len(normal) // pixels_per_chunk)    # ceiling division
 
         if verbose:
-            print(f"{len(pixels)} pixels, k = {k}: {points_per_pixel * len(pixels):,} evaluations "
+            print(f"{len(normal)} pixels, k = {k}: {points_per_pixel * len(normal):,} evaluations "
                   f"in {n_chunks} chunks of up to {pixels_per_chunk} pixels")
 
         start_time = time.perf_counter()
 
-        for i, start in enumerate(range(0, len(pixels), pixels_per_chunk)):
+        for i, start in enumerate(range(0, len(normal), pixels_per_chunk)):
             # Integrate one chunk and store it, so finished chunks survive an interruption
-            chunk = pixels[start:start + pixels_per_chunk]
+            chunk = normal[start:start + pixels_per_chunk]
             self.probability[:, :, chunk] = self._integrate_pixels(chunk, k)   # THE INTEGRAL of this chunk, stored
             self.subpixel_level_used[chunk] = k                                # remember the k of each pixel
 
             if verbose:
                 elapsed = time.perf_counter() - start_time
                 done = start + len(chunk)
-                print(f"  chunk {i + 1}/{n_chunks}: {done}/{len(pixels)} pixels, {elapsed:.0f} s, "
+                print(f"  chunk {i + 1}/{n_chunks}: {done}/{len(normal)} pixels, {elapsed:.0f} s, "
                       f"{done * points_per_pixel / elapsed:,.0f} evaluations/s")
+
+        # Polar pixels, one at a time (k is recorded so that cached results are reused)
+        for i, pixel in enumerate(polar):
+            start_time = time.perf_counter()
+            self.probability[:, :, pixel], n_sky = self._integrate_polar_pixel(pixel, k, points_per_chunk)
+            self.subpixel_level_used[pixel] = k
+
+            if verbose:
+                elapsed = time.perf_counter() - start_time
+                n_points = n_sky * len(self.em_nodes_kev) * len(self.phi_nodes_rad)
+                print(f"  polar pixel {pixel} ({i + 1}/{len(polar)}): {n_sky:,} sky nodes, {elapsed:.0f} s, "
+                      f"{n_points / elapsed:,.0f} evaluations/s")
 
         return self.probability[:, :, pixels].copy()
 
@@ -293,6 +341,30 @@ class NFBinnedTemplate:
         # a: energy bin, b: phi bin, c: pixel; e, p, s: Em, phi and sky nodes.
         return np.einsum("ae,bp,epcs,cs->abc", self._em_matrix, self._phi_matrix,   # weights x density, added
                          density, sky_weights, optimize=True)                         # up per bin -> P_i
+
+    def _integrate_polar_pixel(self, pixel, k, points_per_chunk):
+        """P_i of one polar pixel, with the refined sky nodes of ``_polar_refined_nodes``.
+
+        Returns
+        -------
+        np.ndarray, shape (n_em_bins, n_phi_bins)
+            P_i of the pixel.
+        int
+            Number of sky nodes used.
+        """
+        # 1. Sky nodes: level max(k, polar level); those close to the pole at the pole level
+        level = max(k, self.polar_subpixel_level)
+        colatitude, longitude, sky_weights = self._polar_refined_nodes(
+            self.nside, pixel, self.nest, level, max(level, self.pole_subpixel_level), self.pole_colat_rad)
+
+        # 2.-3. Density and weighted sum as in _integrate_pixels, in pieces of about points_per_chunk evaluations
+        n_sky = max(1, points_per_chunk // (len(self.em_nodes_kev) * len(self.phi_nodes_rad)))   # sky nodes per piece
+        total = np.zeros((self.n_em_bins, self.n_phi_bins))
+        for a in range(0, len(sky_weights), n_sky):
+            density = self._density_on_grid(colatitude[a:a + n_sky], longitude[a:a + n_sky])   # (Em, phi, sky)
+            total += np.einsum("ae,bp,eps,s->ab", self._em_matrix, self._phi_matrix,
+                               density, sky_weights[a:a + n_sky], optimize=True)
+        return total, len(sky_weights)
 
     def _density_on_grid(self, colatitude, longitude):
         """NF density on (Em nodes) x (phi nodes) x (list of sky points).
@@ -428,6 +500,38 @@ class NFBinnedTemplate:
         return colatitude.reshape(children.shape), longitude.reshape(children.shape), weights
 
     @staticmethod
+    def _is_polar(nside, pixels, nest, polar_cap_rad):
+        """True for pixels whose centre is within polar_cap_rad of a pole."""
+        colatitude, _ = hp.pix2ang(nside, pixels, nest=nest)
+        return np.minimum(colatitude, np.pi - colatitude) < polar_cap_rad   # distance to the nearer pole
+
+    @staticmethod
+    def _polar_refined_nodes(nside, pixel, nest, k, k_pole, pole_colat_rad):
+        """Sky nodes of one polar pixel: its 4**k sub-pixels, with those close to the pole split further.
+
+        Sub-pixels with centre within ``pole_colat_rad`` of a pole are replaced by
+        their 4**(k_pole - k) children at ``nside * 2**k_pole``. Each weight is the
+        area of its (sub-)sub-pixel, so the weights still sum to the pixel area.
+
+        Returns
+        -------
+        colatitude, longitude, weights : np.ndarray, shape (n_sky,)
+            Node positions [rad] and weights [sr].
+        """
+        parent_nest = pixel if nest else hp.ring2nest(nside, pixel)
+        children = parent_nest * 4**k + np.arange(4**k)                         # NESTED children at nside * 2**k
+        colat_c, _ = hp.pix2ang(nside * 2**k, children, nest=True)
+        near = np.minimum(colat_c, np.pi - colat_c) < pole_colat_rad            # sub-pixels close to the pole
+
+        m = 4**(k_pole - k)                                                     # children of each of them at k_pole
+        fine = (children[near][:, None] * m + np.arange(m)).ravel()
+        colat_a, lon_a = hp.pix2ang(nside * 2**k, children[~near], nest=True)
+        colat_b, lon_b = hp.pix2ang(nside * 2**k_pole, fine, nest=True)
+        weights = np.concatenate([np.full(len(colat_a), hp.nside2pixarea(nside * 2**k)),
+                                  np.full(len(colat_b), hp.nside2pixarea(nside * 2**k_pole))])
+        return np.concatenate([colat_a, colat_b]), np.concatenate([lon_a, lon_b]), weights
+
+    @staticmethod
     def _node_to_bin_matrix(weights, bin_index, n_bins):
         """M[b, n] = weights[n] if node n lies in bin b, else 0; M @ f sums f over each bin."""
         matrix = np.zeros((n_bins, len(weights)))
@@ -536,8 +640,18 @@ class NFBinnedTemplate:
                                                self._as_breaks(em_breaks_kev))[0])
         n_phi_nodes = len(self._binned_gl_nodes(phi_edges_deg, self._check_int(n_phi_per_bin, "n_phi_per_bin"),
                                                 self._as_breaks(phi_breaks_deg))[0])
-        n_pixels = hp.nside2npix(nside) if pixels is None else len(np.atleast_1d(pixels))
-        return n_em_nodes * n_phi_nodes * 4**self._check_int(subpixel_level, "subpixel_level", minimum=0) * n_pixels
+        k = self._check_int(subpixel_level, "subpixel_level", minimum=0)
+        nest = self._check_scheme(axes["PsiChi"].scheme) == "nested"
+        pixels = np.arange(hp.nside2npix(nside)) if pixels is None else np.atleast_1d(np.asarray(pixels, dtype=np.int64))
+
+        # Sky nodes: 4**k per normal pixel, plus the refined nodes of each polar pixel
+        is_polar = self._is_polar(nside, pixels, nest, self.polar_cap_rad)
+        level = max(k, self.polar_subpixel_level)
+        n_sky = 4**k * int((~is_polar).sum()) + sum(
+            len(self._polar_refined_nodes(nside, p, nest, level, max(level, self.pole_subpixel_level),
+                                          self.pole_colat_rad)[2])
+            for p in pixels[is_polar])
+        return n_em_nodes * n_phi_nodes * n_sky
 
     def _evaluations_per_pixel(self, k):
         # Grid points per pixel: Em nodes x phi nodes x sky nodes
@@ -617,6 +731,14 @@ class NFBinnedTemplate:
         value = float(value)
         if not 0 <= value < 1:
             raise ValueError(f"seam_delta_deg must be in [0, 1) deg, got {value}.")
+        return value
+
+    @staticmethod
+    def _check_angle(value, name):
+        # Angle from a pole [deg]: a number in [0, 90); 0 turns the refinement off
+        value = float(value)
+        if not 0 <= value < 90:
+            raise ValueError(f"{name} must be in [0, 90) deg, got {value}.")
         return value
 
     @staticmethod
