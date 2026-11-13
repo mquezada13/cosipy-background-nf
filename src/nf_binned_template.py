@@ -37,7 +37,10 @@ Quadrature rules
   centre within ``pole_colat_deg`` of the pole are split further to
   ``pole_subpixel_level`` (``_polar_refined_nodes``). Defaults (4 deg, 5, 1 deg,
   7) select the 8 pixels touching the poles at NSIDE 16 and agree with uniform
-  level 7 within 0.3% (notebook 09, Section 10).
+  level 7 within 0.3% (notebook 09, Section 10). The other pixels with centre
+  within ``near_pole_cap_deg`` (10 deg: the next two rings at NSIDE 16) use at
+  least ``near_pole_subpixel_level`` (3); at level 2 they are up to 6% low
+  (notebook 09, Section 11.1).
 
 Units and conventions
 ---------------------
@@ -149,6 +152,11 @@ class NFBinnedTemplate:
         pole are split further.
     pole_subpixel_level : int
         Level of those sub-pixels (at least the level of the polar pixel).
+    near_pole_cap_deg : float
+        Other pixels whose centre is within this angle [deg] of a pole use at
+        least ``near_pole_subpixel_level``. 0 turns this off.
+    near_pole_subpixel_level : int
+        Minimum sub-pixel level of those pixels.
 
     Attributes
     ----------
@@ -162,7 +170,9 @@ class NFBinnedTemplate:
         Half-width of the chi = 0 strip [rad] (from ``seam_delta_deg``).
     polar_cap_rad, pole_colat_rad : float
         ``polar_cap_deg`` and ``pole_colat_deg`` in rad.
-    polar_subpixel_level, pole_subpixel_level : int
+    near_pole_cap_rad : float
+        ``near_pole_cap_deg`` in rad.
+    polar_subpixel_level, pole_subpixel_level, near_pole_subpixel_level : int
         As the parameters.
     probability : np.ndarray, shape (n_em_bins, n_phi_bins, npix), or None
         P_i of the current binning, float64; NaN where not computed; None before
@@ -179,7 +189,9 @@ class NFBinnedTemplate:
                  polar_cap_deg=4.0,
                  polar_subpixel_level=5,
                  pole_colat_deg=1.0,
-                 pole_subpixel_level=7):
+                 pole_subpixel_level=7,
+                 near_pole_cap_deg=10.0,
+                 near_pole_subpixel_level=3):
 
         self.model_path = model_path
         self.batch_size = self._check_int(batch_size, "batch_size")
@@ -191,6 +203,11 @@ class NFBinnedTemplate:
         self.pole_colat_rad = np.deg2rad(self._check_angle(pole_colat_deg, "pole_colat_deg"))
         self.polar_subpixel_level = self._check_int(polar_subpixel_level, "polar_subpixel_level", minimum=0)
         self.pole_subpixel_level = self._check_int(pole_subpixel_level, "pole_subpixel_level", minimum=0)
+
+        # Pixels near (not touching) a pole: a minimum sub-pixel level
+        self.near_pole_cap_rad = np.deg2rad(self._check_angle(near_pole_cap_deg, "near_pole_cap_deg"))
+        self.near_pole_subpixel_level = self._check_int(near_pole_subpixel_level, "near_pole_subpixel_level",
+                                                        minimum=0)
 
         # --- Load the model once, in this process (no `devices` argument -> no worker pool) ---
         nf_background = NFBackground(model_path, density_batch_size=self.batch_size,      # reads the .fits:
@@ -242,7 +259,8 @@ class NFBinnedTemplate:
             Pixel indices (in the scheme of PsiChi); None means all pixels.
         subpixel_level : int
             Sub-pixel level k: 4**k sky nodes per pixel. Polar pixels use the
-            polar rule instead (see ``polar_cap_deg``).
+            polar rule instead (see ``polar_cap_deg``), and pixels near a pole
+            at least ``near_pole_subpixel_level``.
         n_em_per_bin, n_phi_per_bin : int
             GL nodes per Em / phi bin (per piece if the bin is split at a break).
         em_breaks_kev, phi_breaks_deg : array_like or None
@@ -272,32 +290,37 @@ class NFBinnedTemplate:
             "subpixel_level", 
             minimum=0)
 
-        # Polar pixels get their own sky rule (see the module notes); the others use level k
+        # Polar pixels get their own sky rule (see the module notes); the others use level k,
+        # or at least near_pole_subpixel_level within near_pole_cap_deg of a pole
         is_polar = self._is_polar(self.nside, pixels, self.nest, self.polar_cap_rad)
         normal, polar = pixels[~is_polar], pixels[is_polar]
+        levels = self._normal_levels(self.nside, normal, self.nest, k)
 
-        # Group the normal pixels into chunks of about points_per_chunk density evaluations
-        points_per_pixel = self._evaluations_per_pixel(k)                 # n_Em points x n_phi points x 4**k
-        pixels_per_chunk = max(1, points_per_chunk // points_per_pixel)   # how many pixels fit in one chunk
-        n_chunks = -(-len(normal) // pixels_per_chunk)    # ceiling division
+        for level in np.unique(levels):
+            group = normal[levels == level]
 
-        if verbose:
-            print(f"{len(normal)} pixels, k = {k}: {points_per_pixel * len(normal):,} evaluations "
-                  f"in {n_chunks} chunks of up to {pixels_per_chunk} pixels")
-
-        start_time = time.perf_counter()
-
-        for i, start in enumerate(range(0, len(normal), pixels_per_chunk)):
-            # Integrate one chunk and store it, so finished chunks survive an interruption
-            chunk = normal[start:start + pixels_per_chunk]
-            self.probability[:, :, chunk] = self._integrate_pixels(chunk, k)   # THE INTEGRAL of this chunk, stored
-            self.subpixel_level_used[chunk] = k                                # remember the k of each pixel
+            # Group these pixels into chunks of about points_per_chunk density evaluations
+            points_per_pixel = self._evaluations_per_pixel(level)             # n_Em points x n_phi points x 4**level
+            pixels_per_chunk = max(1, points_per_chunk // points_per_pixel)   # how many pixels fit in one chunk
+            n_chunks = -(-len(group) // pixels_per_chunk)    # ceiling division
 
             if verbose:
-                elapsed = time.perf_counter() - start_time
-                done = start + len(chunk)
-                print(f"  chunk {i + 1}/{n_chunks}: {done}/{len(normal)} pixels, {elapsed:.0f} s, "
-                      f"{done * points_per_pixel / elapsed:,.0f} evaluations/s")
+                print(f"{len(group)} pixels, level {level}: {points_per_pixel * len(group):,} evaluations "
+                      f"in {n_chunks} chunks of up to {pixels_per_chunk} pixels")
+
+            start_time = time.perf_counter()
+
+            for i, start in enumerate(range(0, len(group), pixels_per_chunk)):
+                # Integrate one chunk and store it, so finished chunks survive an interruption
+                chunk = group[start:start + pixels_per_chunk]
+                self.probability[:, :, chunk] = self._integrate_pixels(chunk, level)   # THE INTEGRAL of this chunk, stored
+                self.subpixel_level_used[chunk] = k              # the requested k, so that cached results are reused
+
+                if verbose:
+                    elapsed = time.perf_counter() - start_time
+                    done = start + len(chunk)
+                    print(f"  chunk {i + 1}/{n_chunks}: {done}/{len(group)} pixels, {elapsed:.0f} s, "
+                          f"{done * points_per_pixel / elapsed:,.0f} evaluations/s")
 
         # Polar pixels, one at a time (k is recorded so that cached results are reused)
         for i, pixel in enumerate(polar):
@@ -505,6 +528,11 @@ class NFBinnedTemplate:
         colatitude, _ = hp.pix2ang(nside, pixels, nest=nest)
         return np.minimum(colatitude, np.pi - colatitude) < polar_cap_rad   # distance to the nearer pole
 
+    def _normal_levels(self, nside, pixels, nest, k):
+        """Sub-pixel level of each non-polar pixel: k, or at least near_pole_subpixel_level near a pole."""
+        near = self._is_polar(nside, pixels, nest, self.near_pole_cap_rad)
+        return np.where(near, max(k, self.near_pole_subpixel_level), k)
+
     @staticmethod
     def _polar_refined_nodes(nside, pixel, nest, k, k_pole, pole_colat_rad):
         """Sky nodes of one polar pixel: its 4**k sub-pixels, with those close to the pole split further.
@@ -644,10 +672,10 @@ class NFBinnedTemplate:
         nest = self._check_scheme(axes["PsiChi"].scheme) == "nested"
         pixels = np.arange(hp.nside2npix(nside)) if pixels is None else np.atleast_1d(np.asarray(pixels, dtype=np.int64))
 
-        # Sky nodes: 4**k per normal pixel, plus the refined nodes of each polar pixel
+        # Sky nodes: 4**level per normal pixel, plus the refined nodes of each polar pixel
         is_polar = self._is_polar(nside, pixels, nest, self.polar_cap_rad)
         level = max(k, self.polar_subpixel_level)
-        n_sky = 4**k * int((~is_polar).sum()) + sum(
+        n_sky = int((4**self._normal_levels(nside, pixels[~is_polar], nest, k)).sum()) + sum(
             len(self._polar_refined_nodes(nside, p, nest, level, max(level, self.pole_subpixel_level),
                                           self.pole_colat_rad)[2])
             for p in pixels[is_polar])
