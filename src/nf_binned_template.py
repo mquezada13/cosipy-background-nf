@@ -117,7 +117,7 @@ from astropy.time import Time
 from histpy import Histogram, Axes, Axis, HealpixAxis
 from scoords import SpacecraftFrame
 from cosipy.spacecraftfile import SpacecraftHistory
-from cosipy.background_estimation.ml import NFBackground
+from cosipy.response.ml.NFModelIO import load_nf_model
 from cosipy.background_estimation.ml.NFBackgroundModels import BackgroundDensityECDFSplineDGaussianARQSFlow
 
 
@@ -127,15 +127,23 @@ class NFBinnedTemplate:
     Created from the model file only. The binning (histpy Axes with "Em",
     "Phi", "PsiChi") and the quadrature settings are given to ``compute`` and
     ``get_binned_background``. The last results are kept in ``probability``
-    (NaN for pixels not computed yet) and reused while the binning and the
-    quadrature settings stay the same; a call with different ones starts over.
+    (NaN for pixels not computed yet) while the binning, the quadrature settings
+    and the template settings below (chi = 0 strip, pole corrections) stay the
+    same; a call with different ones starts over and says how many computed
+    pixels it discards. ``get_binned_background`` computes only the pixels still
+    missing; ``compute`` always computes the pixels it is given.
 
     Parameters
     ----------
     model_path : str or Path
         NF background model file (.fits), major version 3.
     batch_size : int
-        Number of points per forward pass of the flow (bounds the network's memory).
+        Number of points per forward pass of the flow. It changes the speed and the
+        memory, not the nodes or the weights. Measured on the MacBook CPU (4 threads,
+        model part 01): 4096 gives ~7,500 evaluations/s with ~1.6 GB of RAM;
+        100,000 gives 3,300-5,000 evaluations/s with ~11 GB. From 2048 to 100,000
+        the densities are bit-identical; below 2048 they change slightly (float32
+        rounding: ~1e-5 on the integral of a pixel), so keep it >= 2048.
     device : str
         Torch device for the flow, e.g. "cpu" or "cuda".
     seam_delta_deg : float
@@ -160,6 +168,9 @@ class NFBinnedTemplate:
 
     Attributes
     ----------
+    model_path, batch_size, device
+        As the parameters. Fixed when the template is created (the flow is built
+        with them); changing them later has no effect.
     model_version : str
         Version of the model file.
     model_counts : float
@@ -178,12 +189,14 @@ class NFBinnedTemplate:
         P_i of the current binning, float64; NaN where not computed; None before
         the first call.
     subpixel_level_used : np.ndarray of int, shape (npix,), or None
-        Sub-pixel level used for each pixel; -1 where not computed.
+        Sub-pixel level really used for each pixel (above the requested one near the
+        poles; for polar pixels, the level before the extra refinement at the pole);
+        -1 where not computed.
     """
 
     def __init__(self, 
                  model_path, 
-                 batch_size=100_000,
+                 batch_size=4096,
                  device="cpu",
                  seam_delta_deg=0.2,
                  polar_cap_deg=4.0,
@@ -209,20 +222,21 @@ class NFBinnedTemplate:
         self.near_pole_subpixel_level = self._check_int(near_pole_subpixel_level, "near_pole_subpixel_level",
                                                         minimum=0)
 
-        # --- Load the model once, in this process (no `devices` argument -> no worker pool) ---
-        nf_background = NFBackground(model_path, density_batch_size=self.batch_size,      # reads the .fits:
-                                     density_compile_mode=None, show_progress=False)      # weights, version, counts, livetime
-        self._check_model_version(nf_background)
-        self.model_version = nf_background._version
+        # --- Load the model once, in this process ---
+        # cosipy's reader returns the file as a dict with "version", "density_input" (the weights and
+        # settings of the flow) and "rate_input" (counts and livetime)
+        model_file = load_nf_model(model_path)
+        self.model_version = model_file["version"]
+        self._check_model_version(self.model_version)
 
         # Normalization of the model: R = model_counts / model_livetime
-        rate_input = nf_background._ckpt["rate_input"]
+        rate_input = model_file["rate_input"]
         self.model_counts = float(rate_input["counts"])
         self.model_livetime = float(rate_input["livetime"])
 
         # The density network. Arguments: (density_input, device, batch_size, compile_mode).
         self._density_model = BackgroundDensityECDFSplineDGaussianARQSFlow(       # the network that returns
-            nf_background._density_input, device, self.batch_size, None)          # p(Em, phi, psi, chi)
+            model_file["density_input"], device, self.batch_size, None)           # p(Em, phi, psi, chi)
 
         # --- No binning yet: set by the first compute / get_binned_background call ---
         self._settings = None
@@ -249,6 +263,8 @@ class NFBinnedTemplate:
         evaluations to bound memory (about 50 bytes per evaluation, i.e.
         ~100 MB for the default). Results are written into ``probability``
         chunk by chunk, so an interrupted run keeps the chunks already done.
+        The given pixels are always computed, also if they were computed before
+        (``get_binned_background`` computes only the missing ones).
 
         Parameters
         ----------
@@ -268,7 +284,8 @@ class NFBinnedTemplate:
         points_per_chunk : int
             Target number of density evaluations per chunk (at least one pixel).
         verbose : bool
-            Print one line per chunk with progress and throughput.
+            Print one line per chunk with progress and throughput, and a notice
+            if a change of settings discards computed pixels.
 
         Returns
         -------
@@ -278,10 +295,11 @@ class NFBinnedTemplate:
 
         self._set_binning(                  # Em and phi points for this binning (reused if unchanged)
             axes,
-            n_em_per_bin, 
-            n_phi_per_bin, 
-            em_breaks_kev, 
-            phi_breaks_deg
+            n_em_per_bin,
+            n_phi_per_bin,
+            em_breaks_kev,
+            phi_breaks_deg,
+            verbose
             )
         pixels = self._check_pixels(pixels)
 
@@ -290,14 +308,15 @@ class NFBinnedTemplate:
             "subpixel_level", 
             minimum=0)
 
-        # Polar pixels get their own sky rule (see the module notes); the others use level k,
-        # or at least near_pole_subpixel_level within near_pole_cap_deg of a pole
+        # Level each pixel really gets: k, or more near the poles (the rule is in _levels_used).
+        # Polar pixels also get their own sky rule (see the module notes), so they are done separately
+        levels = self._levels_used(self.nside, pixels, self.nest, k)
         is_polar = self._is_polar(self.nside, pixels, self.nest, self.polar_cap_rad)
         normal, polar = pixels[~is_polar], pixels[is_polar]
-        levels = self._normal_levels(self.nside, normal, self.nest, k)
+        normal_levels, polar_levels = levels[~is_polar], levels[is_polar]
 
-        for level in np.unique(levels):
-            group = normal[levels == level]
+        for level in np.unique(normal_levels):
+            group = normal[normal_levels == level]
 
             # Group these pixels into chunks of about points_per_chunk density evaluations
             points_per_pixel = self._evaluations_per_pixel(level)             # n_Em points x n_phi points x 4**level
@@ -314,7 +333,7 @@ class NFBinnedTemplate:
                 # Integrate one chunk and store it, so finished chunks survive an interruption
                 chunk = group[start:start + pixels_per_chunk]
                 self.probability[:, :, chunk] = self._integrate_pixels(chunk, level)   # THE INTEGRAL of this chunk, stored
-                self.subpixel_level_used[chunk] = k              # the requested k, so that cached results are reused
+                self.subpixel_level_used[chunk] = level          # the level really used (above k near the poles)
 
                 if verbose:
                     elapsed = time.perf_counter() - start_time
@@ -322,11 +341,11 @@ class NFBinnedTemplate:
                     print(f"  chunk {i + 1}/{n_chunks}: {done}/{len(group)} pixels, {elapsed:.0f} s, "
                           f"{done * points_per_pixel / elapsed:,.0f} evaluations/s")
 
-        # Polar pixels, one at a time (k is recorded so that cached results are reused)
-        for i, pixel in enumerate(polar):
+        # Polar pixels, one at a time
+        for i, (pixel, level) in enumerate(zip(polar, polar_levels)):
             start_time = time.perf_counter()
-            self.probability[:, :, pixel], n_sky = self._integrate_polar_pixel(pixel, k, points_per_chunk)
-            self.subpixel_level_used[pixel] = k
+            self.probability[:, :, pixel], n_sky = self._integrate_polar_pixel(pixel, int(level), points_per_chunk)
+            self.subpixel_level_used[pixel] = level          # the level really used (at least polar_subpixel_level)
 
             if verbose:
                 elapsed = time.perf_counter() - start_time
@@ -365,8 +384,8 @@ class NFBinnedTemplate:
         return np.einsum("ae,bp,epcs,cs->abc", self._em_matrix, self._phi_matrix,   # weights x density, added
                          density, sky_weights, optimize=True)                         # up per bin -> P_i
 
-    def _integrate_polar_pixel(self, pixel, k, points_per_chunk):
-        """P_i of one polar pixel, with the refined sky nodes of ``_polar_refined_nodes``.
+    def _integrate_polar_pixel(self, pixel, level, points_per_chunk):
+        """P_i of one polar pixel at sub-pixel level ``level``, with the refined sky nodes of ``_polar_pixel_nodes``.
 
         Returns
         -------
@@ -375,10 +394,8 @@ class NFBinnedTemplate:
         int
             Number of sky nodes used.
         """
-        # 1. Sky nodes: level max(k, polar level); those close to the pole at the pole level
-        level = max(k, self.polar_subpixel_level)
-        colatitude, longitude, sky_weights = self._polar_refined_nodes(
-            self.nside, pixel, self.nest, level, max(level, self.pole_subpixel_level), self.pole_colat_rad)
+        # 1. Sky nodes: the pixel's level (from _levels_used); those close to the pole at the pole level
+        colatitude, longitude, sky_weights = self._polar_pixel_nodes(self.nside, pixel, self.nest, level)
 
         # 2.-3. Density and weighted sum as in _integrate_pixels, in pieces of about points_per_chunk evaluations
         n_sky = max(1, points_per_chunk // (len(self.em_nodes_kev) * len(self.phi_nodes_rad)))   # sky nodes per piece
@@ -420,19 +437,34 @@ class NFBinnedTemplate:
         density = self._density_model.evaluate_density(context, em, phi, chi, psi)   # p at every point
         return density.numpy().astype(np.float64).reshape(shape)                     # back to (n_Em, n_phi, n_sky)
 
-    def _set_binning(self, axes, n_em_per_bin, n_phi_per_bin, em_breaks_kev, phi_breaks_deg):
-        """Prepare the quadrature nodes for this binning; keep the results if nothing changed."""
+    def _set_binning(self, axes, n_em_per_bin, n_phi_per_bin, em_breaks_kev, phi_breaks_deg, verbose=True):
+        """Prepare the quadrature nodes for this binning; keep the results if nothing changed.
+
+        If something changed, the stored results no longer apply and are discarded
+        (with a one-line notice if ``verbose`` and computed pixels are lost).
+        """
         em_edges_kev, phi_edges_deg, nside, scheme = self._check_axes(axes)
         n_em_per_bin = self._check_int(n_em_per_bin, "n_em_per_bin")
         n_phi_per_bin = self._check_int(n_phi_per_bin, "n_phi_per_bin")
         em_breaks_kev = self._as_breaks(em_breaks_kev)
         phi_breaks_deg = self._as_breaks(phi_breaks_deg)
 
-        # Same binning and settings as the last call: reuse the stored nodes and results
+        # Same binning and settings as the last call: reuse the stored nodes and results.
+        # The template settings are included, so changing one on an existing template also starts over
         settings = (tuple(em_edges_kev), tuple(phi_edges_deg), nside, scheme,
-                    n_em_per_bin, n_phi_per_bin, tuple(em_breaks_kev), tuple(phi_breaks_deg))
+                    n_em_per_bin, n_phi_per_bin, tuple(em_breaks_kev), tuple(phi_breaks_deg),
+                    self.seam_delta_rad,                                        # chi = 0 strip
+                    self.polar_cap_rad, self.polar_subpixel_level,              # polar pixels
+                    self.pole_colat_rad, self.pole_subpixel_level,              # ... and their refinement at the pole
+                    self.near_pole_cap_rad, self.near_pole_subpixel_level)      # pixels near a pole
         if settings == self._settings:
             return
+
+        # Something changed: the stored results no longer apply. Say so if computed pixels are lost
+        if verbose and self.subpixel_level_used is not None:
+            n_lost = int((self.subpixel_level_used >= 0).sum())
+            if n_lost:
+                print(f"Settings changed: results of {n_lost} computed pixel(s) discarded.")
 
         # New binning: store it ...
         self.em_edges_kev, self.phi_edges_deg = em_edges_kev, phi_edges_deg
@@ -528,10 +560,29 @@ class NFBinnedTemplate:
         colatitude, _ = hp.pix2ang(nside, pixels, nest=nest)
         return np.minimum(colatitude, np.pi - colatitude) < polar_cap_rad   # distance to the nearer pole
 
-    def _normal_levels(self, nside, pixels, nest, k):
-        """Sub-pixel level of each non-polar pixel: k, or at least near_pole_subpixel_level near a pole."""
-        near = self._is_polar(nside, pixels, nest, self.near_pole_cap_rad)
-        return np.where(near, max(k, self.near_pole_subpixel_level), k)
+    def _levels_used(self, nside, pixels, nest, k):
+        """Sub-pixel level each pixel really gets when level k is requested (what ``subpixel_level_used`` stores).
+
+        The one place where this rule is written: k for most pixels, at least
+        near_pole_subpixel_level near a pole, and at least polar_subpixel_level in
+        polar pixels (before their extra refinement at the pole, see ``_polar_pixel_nodes``).
+        The pixel grid (nside, nest) is an argument so that ``n_evaluations`` can use it
+        before any binning is set.
+        """
+        near = self._is_polar(nside, pixels, nest, self.near_pole_cap_rad)     # within near_pole_cap_deg of a pole
+        polar = self._is_polar(nside, pixels, nest, self.polar_cap_rad)        # the polar pixels
+        levels = np.where(near, max(k, self.near_pole_subpixel_level), k)
+        return np.where(polar, max(k, self.polar_subpixel_level), levels)
+
+    def _polar_pixel_nodes(self, nside, pixel, nest, level):
+        """Sky nodes of one polar pixel at its level (from ``_levels_used``), with this template's pole settings.
+
+        The one place where the pole refinement is chosen: sub-pixels within pole_colat_deg
+        of the pole are split to pole_subpixel_level (at least ``level``).
+        Returns colatitude, longitude [rad] and weights [sr], as ``_polar_refined_nodes``.
+        """
+        return self._polar_refined_nodes(nside, pixel, nest, level,
+                                         max(level, self.pole_subpixel_level), self.pole_colat_rad)
 
     @staticmethod
     def _polar_refined_nodes(nside, pixel, nest, k, k_pole, pole_colat_rad):
@@ -604,9 +655,11 @@ class NFBinnedTemplate:
         tmin, tmax : float
             Time window [s] (unix seconds, as the event TimeTags).
         pixels : array_like of int or None
-            Local frame only: pixels to compute (in the scheme of PsiChi); pixels
-            never computed are NaN in the result. None means all pixels. The
-            Galactic frame needs every pixel, so pixels must be None.
+            Local frame only: pixels to compute (in the scheme of PsiChi). Pixels
+            computed in earlier calls with the same setup are kept in the result;
+            pixels never computed, or stored at another sub-pixel level than this
+            call gives them, are NaN. None means all pixels. The Galactic frame
+            needs every pixel, so pixels must be None.
         subpixel_level, n_em_per_bin, n_phi_per_bin, em_breaks_kev, phi_breaks_deg
             Quadrature settings, as in ``compute``.
         scatt_nside : int
@@ -635,7 +688,12 @@ class NFBinnedTemplate:
         # 3a. Local frame: counts = rate * live time * P
         if frame == "local":
             livetime = float(history.livetime.to_value(u.s).sum())          # total live time in [tmin, tmax] [s]
-            return Histogram(self._axes(SpacecraftFrame()), contents=rate * livetime * self.probability)
+
+            # Only pixels computed with the rule of this call: a pixel stored at another sub-pixel level
+            # (e.g. from a test with a different k on this template) is NaN in the result, like one never computed
+            level_now = self._levels_used(self.nside, np.arange(self.npix), self.nest, k)   # level each pixel gets in this call
+            probability = np.where(self.subpixel_level_used == level_now, self.probability, np.nan)
+            return Histogram(self._axes(SpacecraftFrame()), contents=rate * livetime * probability)
 
         # 3b. Galactic frame: rotate with W (live time each Galactic pixel spends in each local pixel)
         W = galactic_conversion_matrix(history, self.nside, self.nest, scatt_nside)   # (Galactic pix, local pix) [s]
@@ -673,12 +731,11 @@ class NFBinnedTemplate:
         pixels = np.arange(hp.nside2npix(nside)) if pixels is None else np.atleast_1d(np.asarray(pixels, dtype=np.int64))
 
         # Sky nodes: 4**level per normal pixel, plus the refined nodes of each polar pixel
+        levels = self._levels_used(nside, pixels, nest, k)
         is_polar = self._is_polar(nside, pixels, nest, self.polar_cap_rad)
-        level = max(k, self.polar_subpixel_level)
-        n_sky = int((4**self._normal_levels(nside, pixels[~is_polar], nest, k)).sum()) + sum(
-            len(self._polar_refined_nodes(nside, p, nest, level, max(level, self.pole_subpixel_level),
-                                          self.pole_colat_rad)[2])
-            for p in pixels[is_polar])
+        n_sky = int((4**levels[~is_polar]).sum()) + sum(
+            len(self._polar_pixel_nodes(nside, p, nest, int(level))[2])
+            for p, level in zip(pixels[is_polar], levels[is_polar]))
         return n_em_nodes * n_phi_nodes * n_sky
 
     def _evaluations_per_pixel(self, k):
@@ -693,9 +750,9 @@ class NFBinnedTemplate:
                                  coordsys=coordsys, label="PsiChi")])
 
     def _missing_pixels(self, pixels, k):
-        # Requested pixels (None -> all) not computed yet at sub-pixel level k
+        # Requested pixels (None -> all) not computed yet at the level they get for a requested level k
         pixels = self._check_pixels(pixels)
-        return pixels[self.subpixel_level_used[pixels] != k]
+        return pixels[self.subpixel_level_used[pixels] != self._levels_used(self.nside, pixels, self.nest, k)]
 
     @staticmethod
     def _as_breaks(breaks):
@@ -770,12 +827,12 @@ class NFBinnedTemplate:
         return value
 
     @staticmethod
-    def _check_model_version(nf_background):
-        # Only major version 3 (time-independent) models are supported
-        if nf_background._major_version != 3:
+    def _check_model_version(version):
+        # Only major version 3 (time-independent) models are supported; version is a string like "3.00"
+        if int(str(version).split(".")[0]) != 3:
             raise NotImplementedError(
                 f"Only major version 3 (time-independent) models are supported, "
-                f"got version {nf_background._version}.")
+                f"got version {version}.")
 
     def _check_pixels(self, pixels):
         # Pixel indices as a 1D array of unique, valid ints; None means all pixels
