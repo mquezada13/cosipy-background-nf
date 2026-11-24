@@ -41,8 +41,8 @@ dc4_511keV:
     near_pole_subpixel_level: 3
 
   validation:
-    - notebooks/09_nf_background.ipynb, Sections 5-6: Em and Phi quadrature (FINAL)
-    - notebooks/09_nf_background.ipynb, Sections 10-11: chi = 0 seam and pole corrections
+    - notebooks/02_template/09_nf_background.ipynb, Sections 5-6: Em and Phi quadrature (FINAL)
+    - notebooks/02_template/09_nf_background.ipynb, Sections 10-11: chi = 0 seam and pole corrections
     - data/NF_background/convergence/part-01_k2_vs_k3_block0of1.hdf5: sky level k = 2 vs k = 3
 
 #----------------------------------------------------------------------------------------------
