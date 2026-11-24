@@ -2,7 +2,7 @@
 
 Run from the project root, for example:
 
-    .venv/bin/python src/sample_time_independent_background.py --part 1 --samples 100
+    .venv/bin/python scripts/sample_time_independent_background.py --part 1 --samples 100
 
 The output contains CDS coordinates, not physical event times or expected
 counts for an observation. The number of samples is chosen by the user; it

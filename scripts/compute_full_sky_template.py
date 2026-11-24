@@ -2,8 +2,8 @@
 
 Run from the project root (takes ~6 h; resumes if interrupted):
 
-    .venv/bin/python src/compute_full_sky_template.py
-    .venv/bin/python src/compute_full_sky_template.py --max-pixels 2   # quick test run
+    .venv/bin/python scripts/compute_full_sky_template.py
+    .venv/bin/python scripts/compute_full_sky_template.py --max-pixels 2   # quick test run
 
 This is the full-sky version of the last test of notebook 09 (Section 11.2):
 ``NFBinnedTemplate`` with its default settings (chi = 0 strip and pole

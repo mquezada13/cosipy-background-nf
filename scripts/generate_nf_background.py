@@ -22,7 +22,7 @@ This script
 
 Run from the repository root with::
 
-    python src/generate_nf_background.py
+    python scripts/generate_nf_background.py
 """
 
 import json

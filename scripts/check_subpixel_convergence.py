@@ -2,8 +2,8 @@
 
 Run from the project root, for example:
 
-    .venv/bin/python src/check_subpixel_convergence.py                 # whole sky, one process
-    .venv/bin/python src/check_subpixel_convergence.py --max-pixels 4  # quick test run
+    .venv/bin/python scripts/check_subpixel_convergence.py                 # whole sky, one process
+    .venv/bin/python scripts/check_subpixel_convergence.py --max-pixels 4  # quick test run
 
 What it computes
 ----------------
