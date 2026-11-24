@@ -56,8 +56,8 @@ from scoords import SpacecraftFrame
 from cosipy.spacecraftfile import SpacecraftHistory
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))            # so that "src.nf_binned_template" is found
-from src.nf_binned_template import NFBinnedTemplate, galactic_conversion_matrix   # noqa: E402
+sys.path.insert(0, str(PROJECT_ROOT))            # so that "src.nf_template" is found
+from src.nf_template import NFBinnedTemplate, galactic_conversion_matrix, near_pole   # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Settings (the inputs of the template)
@@ -161,7 +161,7 @@ def main():
     npix = 12 * NSIDE**2
     nest = SCHEME == "nested"
     all_pixels = np.arange(npix)
-    is_polar = template._is_polar(NSIDE, all_pixels, nest, template.polar_cap_rad)
+    is_polar = near_pole(NSIDE, all_pixels, nest, template.polar_cap_rad)
     order = np.concatenate([all_pixels[~is_polar], all_pixels[is_polar]])
     if args.max_pixels is not None:
         order = order[:args.max_pixels]

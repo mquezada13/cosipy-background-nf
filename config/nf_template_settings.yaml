@@ -1,0 +1,66 @@
+# Integration settings of the NF binned template (src/nf_template), one block per analysis binning.
+#
+# Each block:
+#   status      validated / not validated
+#   model       NF model the settings were checked with
+#   binning     the analysis binning (from the DC4 dataio yaml)
+#   quadrature  arguments of NFBinnedTemplate.compute / get_binned_background
+#   template    arguments of NFBinnedTemplate(...)
+#   validation  where the settings were checked (notebooks, output files)
+#
+# Angles in deg, energies in keV.
+
+#----------------------------------------------------------------------------------------------
+#--------------------------------- 511 keV line ---------------------------------------------
+#----------------------------------------------------------------------------------------------
+dc4_511keV:
+  status: validated
+  model: model/nfbackground_part-01_v3-00.fits          # component 01 only
+
+  binning:
+    source: dataio_511.yaml
+    em_edges_kev: [509.0, 513.0]                         # 1 energy bin
+    phi_bin_deg: 3                                       # 60 bins, 0-180 deg
+    nside: 16
+    scheme: ring
+
+  quadrature:
+    subpixel_level: 2
+    n_em_per_bin: 4
+    n_phi_per_bin: 4
+    em_breaks_kev: [511.0]
+    phi_breaks_deg: [15.5, 16.0, 16.5, 17.0]
+
+  template:
+    seam_delta_deg: 0.2
+    polar_cap_deg: 4.0
+    polar_subpixel_level: 5
+    pole_colat_deg: 1.0
+    pole_subpixel_level: 7
+    near_pole_cap_deg: 10.0
+    near_pole_subpixel_level: 3
+
+  validation:
+    - notebooks/09_nf_background.ipynb, Sections 5-6: Em and Phi quadrature (FINAL)
+    - notebooks/09_nf_background.ipynb, Sections 10-11: chi = 0 seam and pole corrections
+    - data/NF_background/convergence/part-01_k2_vs_k3_block0of1.hdf5: sky level k = 2 vs k = 3
+
+#----------------------------------------------------------------------------------------------
+#--------------------------------- Crab continuum ---------------------------------------------
+#----------------------------------------------------------------------------------------------
+
+dc4_crab_continuum:
+  status: not validated
+  model:  model/nfbackground_part-01_v3-00.fits          # component 01 only
+
+  binning:
+    source: dataio_continuum.yaml
+    em_edges_kev: [100.0, 158.489, 251.189, 398.107, 630.957, 1000.0,
+                   1584.89, 2511.89, 3981.07, 6309.57, 10000.0]     # 10 energy bins
+    phi_bin_deg: 6                                       # 30 bins, 0-180 deg
+    nside: 8
+    scheme: ring
+
+  quadrature: null                                       # to be determined by a convergence check
+  template: null
+  validation: []

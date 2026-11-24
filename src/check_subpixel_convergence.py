@@ -59,8 +59,8 @@ import torch
 from histpy import Axes, Axis, HealpixAxis
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))            # so that "src.nf_binned_template" is found
-from src.nf_binned_template import NFBinnedTemplate   # noqa: E402
+sys.path.insert(0, str(PROJECT_ROOT))            # so that "src.nf_template" is found
+from src.nf_template import NFBinnedTemplate   # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Settings (the inputs of the check)
@@ -170,8 +170,8 @@ def main():
     # Pixels whose level depends on k: the others give identical numbers at K_LOW and K_HIGH
     all_pixels = np.arange(12 * NSIDE**2)
     nest = SCHEME == "nested"
-    level_low = template._levels_used(NSIDE, all_pixels, nest, K_LOW)
-    level_high = template._levels_used(NSIDE, all_pixels, nest, K_HIGH)
+    level_low = template.subpixel_levels(NSIDE, all_pixels, nest, K_LOW)
+    level_high = template.subpixel_levels(NSIDE, all_pixels, nest, K_HIGH)
     changing = all_pixels[level_low != level_high]
     print(f"{len(changing)} of {len(all_pixels)} pixels change level between k = {K_LOW} and k = {K_HIGH}")
 
