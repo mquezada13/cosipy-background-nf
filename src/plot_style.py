@@ -64,7 +64,7 @@ def set_global_style():
         "font.serif": [_CM_FONT.get_name()],
         "mathtext.fontset": "dejavusans",
         "axes.unicode_minus": False,         # cmr10 has no Unicode minus glyph
-        "axes.formatter.use_mathtext": False,
+        "axes.formatter.use_mathtext": True,
         "text.usetex": False,
         # frame
         "axes.linewidth": 1.5,

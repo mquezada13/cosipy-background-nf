@@ -1,0 +1,45 @@
+# Copy of the DC4 workflow file data/config/imagedeconvolution_gal_511keV.yml; only iteration_max changed (15 -> 30)
+author: Hiroki Yoneda 
+date: 2024-06-12
+model_definition:
+  class: "AllSkyImage"
+  property:
+    coordinate: "galactic"
+    nside: 16
+    scheme: "ring"
+    energy_edges: # shoud be the same as the response matrix
+      value: [509.0, 513.0]
+      unit: "keV"
+    unit: "cm-2 s-1 sr-1" # do not change it as for now
+  initialization:
+    algorithm: "flat" # more methods, e.g., simple-backprojection, user-defined, would be implemented.
+    parameter:
+      value: [1.0e-4] #the number of these values should be the same as "the number of energy_edges - 1".
+      unit: "cm-2 s-1 sr-1"  # do not change it as for now
+deconvolution:
+  algorithm: "RLadvanced"
+  parameter:
+    iteration_max: 30
+    acceleration:
+        activate: True
+        algorithm: "MaxStep"
+        accel_factor_max: 10.0
+        accel_bkg_norm: False
+    response_weighting:
+        activate: False
+        index: 0.5
+    smoothing:
+        activate: False
+        FWHM:
+            value: 2.0
+            unit: "deg"
+    stopping_criteria:
+        statistics: "log-likelihood"
+        threshold: 0.01
+    background_normalization_optimization:
+        activate: True
+        range: {"background": [0.01, 10.0]}
+    save_results:
+        activate: False
+        directory: "./results"
+        only_final_result: False

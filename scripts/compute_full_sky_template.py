@@ -1,9 +1,9 @@
-"""Full-sky binned background template of component 01: FINAL settings, all fixes on.
+"""Full-sky binned background template of one NF component (--part): FINAL settings, all fixes on.
 
-Run from the project root (takes ~6 h; resumes if interrupted):
+Run from the project root (takes ~6.5 h per part; resumes if interrupted):
 
-    .venv/bin/python scripts/compute_full_sky_template.py
-    .venv/bin/python scripts/compute_full_sky_template.py --max-pixels 2   # quick test run
+    .venv/bin/python scripts/compute_full_sky_template.py --part 2
+    .venv/bin/python scripts/compute_full_sky_template.py --part 2 --max-pixels 2   # quick test run
 
 This is the full-sky version of the last test of notebook 09 (Section 11.2):
 ``NFBinnedTemplate`` with its default settings (chi = 0 strip and pole
@@ -13,12 +13,18 @@ corrections on), the FINAL Em / Phi quadrature, sub-pixel level k = 2, the DC4
 Inputs and settings
 -------------------
 All inputs are the constants in the "Settings" block below; they are also
-written into the output files. Command-line options only choose how the run
-is done, not what is computed.
+written into the output files. --part chooses the model file
+(model/nfbackground_part-0X_v3-00.fits); the other command-line options only
+choose how the run is done, not what is computed.
 
-Output (default: data/NF_background/template/)
+The part 01 template in data/NF_background/template/ was computed with the
+earlier Phi breaks [15.5, 16, 16.5, 17] (notebook 09). Parts 02-04 use the
+breaks below, validated in notebook 13; with them part 01 changes by <= 0.13%
+in the bin 90-93 deg (notebook 13, Section 6).
+
+Output (default: data/NF_background/template/), X = part number
 ------
-1. part-01_FINAL_k2_P.hdf5 -- written while running, one save per step:
+1. part-0X_FINAL_k2_P.hdf5 -- written while running, one save per step:
        pixels               (3072,)        pixel indices (RING, NSIDE 16), in computing order
        P                    (1, 60, 3072)  P_i, NF density integrated per bin (dimensionless; NaN = not done)
        subpixel_level_used  (3072,)        level each pixel really got (2; 3 near the poles; 5 + refinement at the poles)
@@ -28,17 +34,17 @@ Output (default: data/NF_background/template/)
 2. When every pixel is done, the expected counts in [TMIN, TMAX] as histpy
    Histograms (axes Em, Phi, PsiChi), in the same way as
    ``NFBinnedTemplate.get_binned_background``:
-       part-01_FINAL_k2_511keV_DC4binning_local.hdf5      spacecraft frame
-       part-01_FINAL_k2_511keV_DC4binning_galactic.hdf5   Galactic frame
+       part-0X_FINAL_k2_511keV_DC4binning_local.hdf5      spacecraft frame
+       part-0X_FINAL_k2_511keV_DC4binning_galactic.hdf5   Galactic frame
    N_i = R * T * P_i, R = model_counts / model_livetime, T = live time from the .ori file.
 
 If file 1 exists, the run resumes with the pixels not done yet, provided all
 settings in the file match; otherwise it stops without changing the file.
 Existing count histograms are never overwritten.
 
-Cost: ~2,048 evaluations per sky node (8 Em x 256 Phi nodes). Ordinary pixels
-16 sky nodes, near-pole pixels 64, polar pixels ~1,850 (~12 min each, done last,
-one per step). About 6 h in total at ~6,500 evaluations/s.
+Cost: ~2,208 evaluations per sky node (8 Em x 276 Phi nodes). Ordinary pixels
+16 sky nodes, near-pole pixels 64, polar pixels ~1,850 (~13 min each, done last,
+one per step). About 6.5 h per part at ~6,500 evaluations/s.
 """
 
 import argparse
@@ -63,8 +69,8 @@ from src.nf_template import NFBinnedTemplate, galactic_conversion_matrix, near_p
 # Settings (the inputs of the template)
 # ---------------------------------------------------------------------------
 
-# NF model (component 01, version 3.00) and orientation file (attitude and live time)
-MODEL_PATH = PROJECT_ROOT / "model/nfbackground_part-01_v3-00.fits"
+# NF model of one component (version 3.00; the part is chosen with --part) and orientation file
+MODEL_PATH_PATTERN = "model/nfbackground_part-{part:02d}_v3-00.fits"
 ORI_PATH = PROJECT_ROOT / "data/DC4_orientation.ori"
 
 # Time window of the analysis [unix s] (as in notebook 09)
@@ -78,9 +84,11 @@ NSIDE, SCHEME = 16, "ring"                 # PsiChi: 3072 pixels
 # Sky: sub-pixel level k (4**k sky nodes per ordinary pixel; more near the poles, see TEMPLATE_SETTINGS)
 SUBPIXEL_LEVEL = 2
 
-# Em and Phi quadrature: FINAL of notebook 09 (Sections 5-6):
-# 4 GL points on each side of 511 keV, 4 per Phi bin, and bin 15-18 deg split at the edge near 16 deg
-FINAL = dict(n_em_per_bin=4, n_phi_per_bin=4, em_breaks_kev=[511.0], phi_breaks_deg=[15.5, 16.0, 16.5, 17.0])
+# Em and Phi quadrature: FINAL of notebook 09 (Sections 5-6), Phi breaks extended in notebook 13 (Section 6.2):
+# 4 GL points on each side of 511 keV, 4 per Phi bin; bin 15-18 deg split at the edge near 16 deg,
+# bin 87-90 deg split at 89.5 deg and bin 90-93 deg split at the peak just above 90 deg (parts 03, 04)
+FINAL = dict(n_em_per_bin=4, n_phi_per_bin=4, em_breaks_kev=[511.0],
+             phi_breaks_deg=[15.5, 16.0, 16.5, 17.0, 89.5, 90.5, 91.0, 91.5, 92.0])
 
 # Template settings: the defaults of NFBinnedTemplate (all fixes on), written out so they are visible and saved
 TEMPLATE_SETTINGS = dict(
@@ -101,10 +109,10 @@ SCATT_NSIDE = 32
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data/NF_background/template"
 
 
-def settings_as_attrs():
+def settings_as_attrs(model_path):
     """All settings as HDF5 attributes (to save, and to compare when resuming)."""
     attrs = {
-        "model_file": MODEL_PATH.name,
+        "model_file": model_path.name,
         "ori_file": ORI_PATH.name,
         "tmin": TMIN,
         "tmax": TMAX,
@@ -138,13 +146,16 @@ def same_attrs(saved, wanted):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--part", type=int, required=True, choices=[1, 2, 3, 4, 5],
+                        help="NF component: model/nfbackground_part-0X_v3-00.fits.")
     parser.add_argument("--threads", type=int, default=4, help="Torch threads (4 measured fastest).")
     parser.add_argument("--pixels-per-step", type=int, default=48, help="Ordinary pixels computed between two saves.")
     parser.add_argument("--max-pixels", type=int, default=None, help="Only the first n pixels (test; no count histograms).")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     args = parser.parse_args()
 
-    for path in (MODEL_PATH, ORI_PATH):
+    model_path = PROJECT_ROOT / MODEL_PATH_PATTERN.format(part=args.part)
+    for path in (model_path, ORI_PATH):
         if not path.is_file():
             raise FileNotFoundError(path)
     torch.set_num_threads(args.threads)
@@ -154,8 +165,8 @@ def main():
                  Axis(np.asarray(PHI_EDGES_DEG, dtype=float) * u.deg, label="Phi"),
                  HealpixAxis(nside=NSIDE, scheme=SCHEME, label="PsiChi")])
 
-    template = NFBinnedTemplate(MODEL_PATH, **TEMPLATE_SETTINGS)
-    print(f"model {MODEL_PATH.name}, version {template.model_version}, model_counts {template.model_counts:,.0f}")
+    template = NFBinnedTemplate(model_path, **TEMPLATE_SETTINGS)
+    print(f"model {model_path.name}, version {template.model_version}, model_counts {template.model_counts:,.0f}")
 
     # Computing order: ordinary and near-pole pixels first, the 8 slow polar pixels last
     npix = 12 * NSIDE**2
@@ -166,10 +177,10 @@ def main():
     if args.max_pixels is not None:
         order = order[:args.max_pixels]
 
-    name = "part-01_FINAL_k2" + (f"_test{args.max_pixels}" if args.max_pixels is not None else "")
+    name = f"part-{args.part:02d}_FINAL_k2" + (f"_test{args.max_pixels}" if args.max_pixels is not None else "")
     p_path = args.output_dir / f"{name}_P.hdf5"
     p_path.parent.mkdir(parents=True, exist_ok=True)
-    wanted = settings_as_attrs()
+    wanted = settings_as_attrs(model_path)
     n_em, n_phi = len(EM_EDGES_KEV) - 1, len(PHI_EDGES_DEG) - 1
 
     # Create the file, or check it before resuming

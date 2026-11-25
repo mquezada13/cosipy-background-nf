@@ -45,6 +45,21 @@ dc4_511keV:
     - notebooks/02_511_template/09_nf_background.ipynb, Sections 10-11: chi = 0 seam and pole corrections
     - data/NF_background/convergence/part-01_k2_vs_k3_block0of1.hdf5: sky level k = 2 vs k = 3
 
+  # The quadrature block above is what the part 01 template used (and what notebooks 11 and 13 read).
+  # Parts 02-04 use the same settings except phi_breaks_deg, extended around phi = 90 deg
+  # (edge + peak in parts 03 and 04), as in scripts/compute_full_sky_template.py.
+  # Validated in notebooks/02_511_template/13_all_components_511keV.ipynb on test pixels, parts 01-04:
+  # Em (Section 5), Phi (Sections 6, 6.2), k = 2 vs 3 (Section 7), polar pixel 0 (Section 8).
+  # Not re-tested for 02-04: chi = 0 strip and near-pole level (part 01 values applied).
+  components:
+    # Groups as requested from Pascal (Figure 10 labels of the DC4 background paper);
+    # NOT verified against his training selections.
+    part-01: {group: EGB photons, labels: b, phi_breaks_deg: [15.5, 16.0, 16.5, 17.0]}
+    part-02: {group: albedo photons, labels: c, phi_breaks_deg: [15.5, 16.0, 16.5, 17.0, 89.5, 90.5, 91.0, 91.5, 92.0]}
+    part-03: {group: albedo + primary positrons, labels: f + m, phi_breaks_deg: [15.5, 16.0, 16.5, 17.0, 89.5, 90.5, 91.0, 91.5, 92.0]}
+    part-04: {group: combined, labels: e + g + i + j + k + l, phi_breaks_deg: [15.5, 16.0, 16.5, 17.0, 89.5, 90.5, 91.0, 91.5, 92.0]}
+    part-05: {group: SAA photons, labels: h, excluded: DC4 excludes SAA passages}
+
 #----------------------------------------------------------------------------------------------
 #--------------------------------- Crab continuum ---------------------------------------------
 #----------------------------------------------------------------------------------------------
