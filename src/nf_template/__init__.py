@@ -37,6 +37,6 @@ Example (DC4 511 keV imaging binning, from the repository root)
 
 from .template import NFBinnedTemplate
 from .galactic import galactic_conversion_matrix
-from .quadrature import near_pole
+from .quadrature import near_pole, ring_from_pole
 
 __all__ = ["NFBinnedTemplate", "galactic_conversion_matrix", "near_pole"]

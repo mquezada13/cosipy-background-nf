@@ -33,11 +33,11 @@ dc4_511keV:
 
   template:
     seam_delta_deg: 0.2
-    polar_cap_deg: 4.0
+    polar_rings: 1                 # HEALPix rings from each pole (= centre < 4 deg at NSIDE 16)
     polar_subpixel_level: 5
     pole_colat_deg: 1.0
     pole_subpixel_level: 7
-    near_pole_cap_deg: 10.0
+    near_pole_rings: 3             # (= centre < 10 deg at NSIDE 16)
     near_pole_subpixel_level: 3
 
   validation:

@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))                    # so that "src.nf_template" is found
 from src.nf_template import NFBinnedTemplate, galactic_conversion_matrix   # noqa: E402
 from src.nf_template.quadrature import (gl_nodes, binned_gl_nodes, node_to_bin_matrix,   # noqa: E402
-                                        healpix_subpixel_nodes, polar_pixel_nodes, near_pole)
+                                        healpix_subpixel_nodes, polar_pixel_nodes, near_pole,
+                                        ring_from_pole)
 
 ORI_FILE = ROOT / "data/DC4_orientation.ori"
 TMIN = 1835487300.0                              # start of the DC4 orientation file [unix s]
@@ -66,8 +67,8 @@ def constant_density(em, phi, chi, psi):
 
 
 # Pole settings scaled to NSIDE 4 (its pixel centres are > 4 deg from the poles), small levels for speed
-POLE_SETTINGS = dict(polar_cap_deg=20.0, polar_subpixel_level=2, pole_colat_deg=8.0, pole_subpixel_level=3,
-                     near_pole_cap_deg=40.0, near_pole_subpixel_level=1)
+POLE_SETTINGS = dict(polar_rings=1, polar_subpixel_level=2, pole_colat_deg=8.0, pole_subpixel_level=3,
+                     near_pole_rings=3, near_pole_subpixel_level=1)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,31 @@ def test_subpixel_weights_cover_the_sky(nest):
     _, _, weights = healpix_subpixel_nodes(nside, level, pixels, nest=nest)
     assert np.allclose(weights.sum(axis=1), hp.nside2pixarea(nside))
     assert np.isclose(weights.sum(), 4 * np.pi)
+
+
+def test_ring_from_pole():
+    # 1 = the ring touching the nearer pole (4 pixels at each pole), up to 2 * nside at the equator
+    for nside in (1, 2, 4, 8, 16):
+        for nest in (False, True):
+            pixels = np.arange(hp.nside2npix(nside))
+            ring = ring_from_pole(nside, pixels, nest)
+            colatitude = hp.pix2ang(nside, pixels, nest=nest)[0]
+            to_pole = np.minimum(colatitude, np.pi - colatitude)
+            assert ring.min() == 1 and ring.max() == 2 * nside and np.sum(ring == 1) == 8
+            assert all(np.ptp(to_pole[ring == r]) < 1e-9 for r in np.unique(ring))   # one distance per ring
+            assert np.all(np.diff(ring[np.argsort(to_pole)]) >= 0)                   # rings ordered by distance
+
+
+def test_rings_select_the_511_kev_pixels():
+    # At NSIDE 16, 1 and 3 rings are exactly the former angles: centre within 4 and 10 deg of a pole
+    pixels = np.arange(hp.nside2npix(16))
+    ring = ring_from_pole(16, pixels, False)
+    assert np.array_equal(ring <= 1, near_pole(16, pixels, False, np.deg2rad(4.0)))
+    assert np.array_equal(ring <= 3, near_pole(16, pixels, False, np.deg2rad(10.0)))
+    levels = AnalyticTemplate(constant_density).subpixel_levels(16, pixels, False, 2)          # defaults
+    assert np.array_equal(levels, np.where(ring <= 1, 5, np.where(ring <= 3, 3, 2)))
+    off = AnalyticTemplate(constant_density, polar_rings=0, near_pole_rings=0)                 # corrections off
+    assert np.all(off.subpixel_levels(16, pixels, False, 2) == 2)
 
 
 def test_polar_nodes_cover_the_pixel():

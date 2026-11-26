@@ -156,6 +156,35 @@ def near_pole(
     return np.minimum(colatitude, np.pi - colatitude) < cap_rad   # distance to the nearer pole
 
 
+def ring_from_pole(
+        nside: int,
+        pixels: ArrayLike,
+        nest: bool
+        ) -> np.ndarray:
+    """
+    HEALPix ring of each pixel, counted from the nearer pole: 1 = the ring touching the pole.
+
+    Parameters
+    ----------
+    nside : int
+        HEALPix NSIDE.
+    pixels : array_like of int
+        Pixel indices.
+    nest : bool
+        True for NESTED ordering, False for RING.
+
+    Returns
+    -------
+    np.ndarray of int (n_pixels,)
+        1 to 2 * nside (the equator ring has 2 * nside).
+    """
+    all_colatitudes = hp.pix2ang(nside, np.arange(hp.nside2npix(nside)))[0]
+    ring_colatitudes = np.unique(np.round(all_colatitudes, 12))                   # the 4 * nside - 1 rings, north to south
+    colatitude, _ = hp.pix2ang(nside, np.atleast_1d(pixels), nest=nest)
+    from_north = np.searchsorted(ring_colatitudes, np.round(colatitude, 12)) + 1  # 1 = northernmost ring
+    return np.minimum(from_north, len(ring_colatitudes) + 1 - from_north)
+
+
 def healpix_subpixel_nodes(
         nside: int, 
         level: int, 

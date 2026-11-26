@@ -63,7 +63,7 @@ from cosipy.spacecraftfile import SpacecraftHistory
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))            # so that "src.nf_template" is found
-from src.nf_template import NFBinnedTemplate, galactic_conversion_matrix, near_pole   # noqa: E402
+from src.nf_template import NFBinnedTemplate, galactic_conversion_matrix, ring_from_pole   # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Settings (the inputs of the template)
@@ -95,11 +95,11 @@ TEMPLATE_SETTINGS = dict(
     batch_size=4096,               # points per forward pass (>= 2048 keeps results bit-identical)
     device="cpu",
     seam_delta_deg=0.2,            # chi = 0 strip
-    polar_cap_deg=4.0,             # polar pixels: centre < 4 deg from a pole ...
+    polar_rings=1,                 # polar pixels: the HEALPix ring touching each pole ...
     polar_subpixel_level=5,        # ... at level 5 ...
     pole_colat_deg=1.0,            # ... and sub-pixels within 1 deg of the pole ...
     pole_subpixel_level=7,         # ... at level 7
-    near_pole_cap_deg=10.0,        # pixels with centre < 10 deg from a pole ...
+    near_pole_rings=3,             # pixels in the first 3 rings from a pole ...
     near_pole_subpixel_level=3,    # ... at least level 3
 )
 
@@ -172,7 +172,7 @@ def main():
     npix = 12 * NSIDE**2
     nest = SCHEME == "nested"
     all_pixels = np.arange(npix)
-    is_polar = near_pole(NSIDE, all_pixels, nest, template.polar_cap_rad)
+    is_polar = ring_from_pole(NSIDE, all_pixels, nest) <= template.polar_rings
     order = np.concatenate([all_pixels[~is_polar], all_pixels[is_polar]])
     if args.max_pixels is not None:
         order = order[:args.max_pixels]

@@ -29,7 +29,7 @@ from cosipy.background_estimation.ml.NFBackgroundModels import ConstantBackgroun
 from cosipy.background_estimation.free_norm_threeml_binned_bkg import FreeNormBinnedBackground   # cosipy's free_norm_threeml_binned_bkg.py
 
 from .quadrature import (as_breaks, binned_gl_nodes, node_to_bin_matrix,
-                         near_pole, healpix_subpixel_nodes, polar_pixel_nodes)
+                         ring_from_pole, healpix_subpixel_nodes, polar_pixel_nodes)
 from .galactic import galactic_conversion_matrix
 
 logger = logging.getLogger(__name__)
@@ -51,11 +51,16 @@ class NFBinnedTemplate:
         Points per flow call (speed and memory only; keep >= 2048).
     device : str, default "cpu"
         Torch device.
-    seam_delta_deg, polar_cap_deg, polar_subpixel_level, pole_colat_deg,
-    pole_subpixel_level, near_pole_cap_deg, near_pole_subpixel_level
+    seam_delta_deg, polar_rings, polar_subpixel_level, pole_colat_deg,
+    pole_subpixel_level, near_pole_rings, near_pole_subpixel_level
         Sky-node corrections at the chi = 0 seam and near the poles, for the
-        version 3.00 models. Defaults validated in notebook 09; normally leave
-        them unchanged.
+        version 3.00 models. Defaults validated in notebook 09 (NSIDE 16).
+        polar_rings and near_pole_rings count HEALPix rings from each pole
+        (1 = the ring touching it; 0 = correction off): polar pixels get the
+        refined polar integration, near-pole pixels at least
+        near_pole_subpixel_level. pole_colat_deg acts inside the polar pixels
+        (on sub-pixels). At NSIDE 16, polar_rings = 1 and near_pole_rings = 3
+        are the pixels with centre within 4 and 10 deg of a pole.
 
     Attributes
     ----------
@@ -76,11 +81,11 @@ class NFBinnedTemplate:
                  batch_size: int = 4096,
                  device: str = "cpu",
                  seam_delta_deg: float = 0.2,
-                 polar_cap_deg: float = 4.0,
+                 polar_rings: int = 1,
                  polar_subpixel_level: int = 5,
                  pole_colat_deg: float = 1.0,
                  pole_subpixel_level: int = 7,
-                 near_pole_cap_deg: float = 10.0,
+                 near_pole_rings: int = 3,
                  near_pole_subpixel_level: int = 3) -> None:
 
         self.model_path = model_path
@@ -91,13 +96,13 @@ class NFBinnedTemplate:
         self.seam_delta_rad = np.deg2rad(_check_seam_delta(seam_delta_deg))
 
         # Polar pixels: finer sky nodes, and finer still close to the pole
-        self.polar_cap_rad = np.deg2rad(_check_angle(polar_cap_deg, "polar_cap_deg"))
+        self.polar_rings = _check_int(polar_rings, "polar_rings", minimum=0)
         self.polar_subpixel_level = _check_int(polar_subpixel_level, "polar_subpixel_level", minimum=0)
         self.pole_colat_rad = np.deg2rad(_check_angle(pole_colat_deg, "pole_colat_deg"))
         self.pole_subpixel_level = _check_int(pole_subpixel_level, "pole_subpixel_level", minimum=0)
 
         # Pixels near (not touching) a pole: a minimum sub-pixel level
-        self.near_pole_cap_rad = np.deg2rad(_check_angle(near_pole_cap_deg, "near_pole_cap_deg"))
+        self.near_pole_rings = _check_int(near_pole_rings, "near_pole_rings", minimum=0)
         self.near_pole_subpixel_level = _check_int(near_pole_subpixel_level, "near_pole_subpixel_level",
                                                    minimum=0)
 
@@ -168,9 +173,9 @@ class NFBinnedTemplate:
                     tuple(em_breaks_kev), 
                     tuple(phi_breaks_deg),
                     self.seam_delta_rad,                                        # chi = 0 strip
-                    self.polar_cap_rad, self.polar_subpixel_level,              # polar pixels
+                    self.polar_rings, self.polar_subpixel_level,                # polar pixels
                     self.pole_colat_rad, self.pole_subpixel_level,              # ... and their refinement at the pole
-                    self.near_pole_cap_rad, self.near_pole_subpixel_level)      # pixels near a pole
+                    self.near_pole_rings, self.near_pole_subpixel_level)        # pixels near a pole
         if settings == self._settings:
             return
 
@@ -285,11 +290,12 @@ class NFBinnedTemplate:
         np.ndarray of int (n_pixels,)
         """
         pixels = np.atleast_1d(np.asarray(pixels, dtype=np.int64))
-        near = near_pole(nside, pixels, nest, self.near_pole_cap_rad)       # within near_pole_cap_deg of a pole
-        polar = near_pole(nside, pixels, nest, self.polar_cap_rad)          # the polar pixels
+        ring = ring_from_pole(nside, pixels, nest)                          # 1 = ring touching a pole
+        near = ring <= self.near_pole_rings                                 # near-pole rings
+        polar = ring <= self.polar_rings                                    # the polar pixels
 
-        levels = np.where(near, max(subpixel_level, self.near_pole_subpixel_level), subpixel_level)   # near-pole (<= 10 deg): at least 3; others: subpixel_level
-        levels = np.where(polar, max(subpixel_level, self.polar_subpixel_level), levels)             # polar (<= 4 deg): at least 5; others: unchanged
+        levels = np.where(near, max(subpixel_level, self.near_pole_subpixel_level), subpixel_level)   # near-pole (rings 1-3): at least 3; others: subpixel_level
+        levels = np.where(polar, max(subpixel_level, self.polar_subpixel_level), levels)             # polar (ring 1): at least 5; others: unchanged
         return levels
 
 
@@ -310,7 +316,7 @@ class NFBinnedTemplate:
         normal, normal_levels, polar, polar_levels : np.ndarray of int
         """
         levels = self.subpixel_levels(nside, pixels, nest, subpixel_level)
-        polar = near_pole(nside, pixels, nest, self.polar_cap_rad)        # polar pixels go to the polar routine
+        polar = ring_from_pole(nside, pixels, nest) <= self.polar_rings     # polar pixels go to the polar routine
         return pixels[~polar], levels[~polar], pixels[polar], levels[polar]
 
     # -----------------------------------------------------------------------
